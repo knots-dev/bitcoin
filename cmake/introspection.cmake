@@ -279,7 +279,7 @@ if(NOT MSVC)
     #if defined(__clang__)
     #pragma clang attribute push(__attribute__((__target__("armv8-a+crypto"))), apply_to = function)
     #elif defined(__GNUC__)
-    #pragma GCC target ("armv8-a+crypto")
+    #pragma GCC target ("+crypto")
     #endif
 
     int main()
