@@ -42,15 +42,19 @@ static constexpr int MAX_32BIT_MEMPOOL_MB{500};
 namespace {
 util::Result<void> ApplyArgsManOptions(const ArgsManager& argsman, MemPoolLimits& mempool_limits)
 {
+    // Apple clang rejects a bare braced-init-list as a non-type template
+    // argument, so name the options type explicitly.
+    using SizeLimitOptions = ArgsManager::AssignIntArgToVarOptions<int64_t>;
+
     mempool_limits.ancestor_count = argsman.GetIntArg("-limitancestorcount", mempool_limits.ancestor_count);
 
-    if (auto err = argsman.AssignIntArgToVar<decltype(mempool_limits.ancestor_size_vbytes), {.min = 0, .multiplier = 1'000}>("limitancestorsize", mempool_limits.ancestor_size_vbytes); !err) {
+    if (auto err = argsman.AssignIntArgToVar<int64_t, SizeLimitOptions{.min = 0, .multiplier = 1'000}>("limitancestorsize", mempool_limits.ancestor_size_vbytes); !err) {
         return err;
     }
 
     mempool_limits.descendant_count = argsman.GetIntArg("-limitdescendantcount", mempool_limits.descendant_count);
 
-    if (auto err = argsman.AssignIntArgToVar<decltype(mempool_limits.descendant_size_vbytes), {.min = 0, .multiplier = 1'000}>("limitdescendantsize", mempool_limits.descendant_size_vbytes); !err) {
+    if (auto err = argsman.AssignIntArgToVar<int64_t, SizeLimitOptions{.min = 0, .multiplier = 1'000}>("limitdescendantsize", mempool_limits.descendant_size_vbytes); !err) {
         return err;
     }
 
