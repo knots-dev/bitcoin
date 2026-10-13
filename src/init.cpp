@@ -7,6 +7,7 @@
 
 #include <init.h>
 
+#include <key_io.h>
 #include <kernel/checks.h>
 
 #include <addrman.h>
@@ -56,6 +57,7 @@
 #include <node/chainstatemanager_args.h>
 #include <node/context.h>
 #include <node/interface_ui.h>
+#include <node/cpuminer.h>
 #include <node/kernel_notifications.h>
 #include <node/mempool_args.h>
 #include <node/mempool_persist.h>
@@ -74,6 +76,7 @@
 #include <rpc/util.h>
 #include <scheduler.h>
 #include <script/sigcache.h>
+#include <script/solver.h>
 #include <stats/stats.h>
 #include <sync.h>
 #include <torcontrol.h>
@@ -309,6 +312,9 @@ void Shutdown(NodeContext& node)
     util::ThreadRename("shutoff");
     if (node.mempool) node.mempool->AddTransactionsUpdated(1);
 
+    // Stop the CPU miner first: its workers use the chainstate and mining interface.
+    if (node.cpu_miner) node.cpu_miner->Stop();
+
     StopHTTPRPC();
     StopREST();
     StopRPC();
@@ -408,6 +414,7 @@ void Shutdown(NodeContext& node)
     if (node.validation_signals) {
         node.validation_signals->UnregisterAllValidationInterfaces();
     }
+    node.cpu_miner.reset();
     node.mempool.reset();
     node.fee_estimator.reset();
     node.chainman.reset();
@@ -786,6 +793,9 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-blockmintxfee=<amt>", strprintf("Set lowest fee rate (in %s/kvB) for transactions to be included in block creation. (default: %s)", CURRENCY_UNIT, FormatMoney(DEFAULT_BLOCK_MIN_TX_FEE)), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
     argsman.AddArg("-blockprioritysize=<n>", strprintf("Set maximum size of high-priority/low-fee transactions in bytes (default: %d)", DEFAULT_BLOCK_PRIORITY_SIZE), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
     argsman.AddArg("-blockversion=<n>", "Override block version to test forking scenarios", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::BLOCK_CREATION);
+    argsman.AddArg("-gen", strprintf("Start the built-in CPU miner at startup; requires -miningaddress (default: %u). Intended for regtest/signet/testnet; for mainnet use an external miner via getblocktemplate, e.g. the DATUM Gateway (see contrib/datum).", node::DEFAULT_GENERATE), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
+    argsman.AddArg("-genproclimit=<n>", strprintf("Number of threads used by the built-in CPU miner, -1 for one per hardware thread (default: %d)", node::DEFAULT_GENPROCLIMIT), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
+    argsman.AddArg("-miningaddress=<addr>", "Address that receives the coinbase reward of blocks found by the built-in CPU miner (used by -gen and by setgenerate when no address is given)", ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
 
     argsman.AddArg("-rest", strprintf("Accept public REST requests (default: %u)", DEFAULT_REST_ENABLE), ArgsManager::ALLOW_ANY, OptionsCategory::RPC);
     argsman.AddArg("-rpcallowip=<ip>", "Allow JSON-RPC connections from specified source. Valid values for <ip> are a single IP (e.g. 1.2.3.4), a network/netmask (e.g. 1.2.3.4/255.255.255.0), a network/CIDR (e.g. 1.2.3.4/24), all ipv4 (0.0.0.0/0), or all ipv6 (::/0). RFC4193 is allowed only if -cjdnsreachable=0. This option can be specified multiple times", ArgsManager::ALLOW_ANY, OptionsCategory::RPC);
@@ -1198,6 +1208,16 @@ bool AppInitParameterInteraction(const ArgsManager& args)
         const auto max_block_weight = args.GetIntArg("-blockmaxweight", DEFAULT_BLOCK_MAX_WEIGHT);
         if (max_block_weight > MAX_BLOCK_WEIGHT) {
             return InitError(strprintf(_("Specified -blockmaxweight (%d) exceeds consensus maximum block weight (%d)"), max_block_weight, MAX_BLOCK_WEIGHT));
+        }
+    }
+
+    if (args.GetBoolArg("-gen", node::DEFAULT_GENERATE) || args.IsArgSet("-miningaddress")) {
+        const std::string mining_address{args.GetArg("-miningaddress", "")};
+        if (mining_address.empty()) {
+            return InitError(_("-gen requires -miningaddress=<addr> to be set"));
+        }
+        if (!IsValidDestination(DecodeDestination(mining_address))) {
+            return InitError(strprintf(_("Invalid -miningaddress: '%s'"), mining_address));
         }
     }
 
@@ -2542,6 +2562,13 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     SetRPCWarmupFinished();
 
     uiInterface.InitMessage(_("Done loading"));
+
+    if (args.GetBoolArg("-gen", node::DEFAULT_GENERATE)) {
+        // Address validity was checked in AppInitParameterInteraction.
+        const CScript coinbase_script{GetScriptForDestination(DecodeDestination(args.GetArg("-miningaddress", "")))};
+        node.cpu_miner = std::make_unique<node::CpuMiner>(*node.chainman, *node.mining);
+        node.cpu_miner->Start(args.GetIntArg("-genproclimit", node::DEFAULT_GENPROCLIMIT), coinbase_script);
+    }
 
     if (g_software_expiry) {
         scheduler.scheduleFromNow([&node] {

@@ -40,6 +40,7 @@ class SignalInterrupt;
 }
 
 namespace node {
+class CpuMiner;
 class KernelNotifications;
 class Warnings;
 
@@ -79,6 +80,7 @@ struct NodeContext {
     //! Reference to chain client that should used to load or create wallets
     //! opened by the gui.
     std::unique_ptr<interfaces::Mining> mining;
+    std::unique_ptr<CpuMiner> cpu_miner; //!< Built-in CPU miner (see setgenerate)
     interfaces::WalletLoader* wallet_loader{nullptr};
     std::unique_ptr<CScheduler> scheduler;
     std::function<void()> rpc_interruption_point = [] {};

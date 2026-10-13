@@ -6,6 +6,7 @@
 #include <bitcoin-build-config.h> // IWYU pragma: keep
 
 #include <chain.h>
+#include <common/args.h>
 #include <chainparams.h>
 #include <chainparamsbase.h>
 #include <clientversion.h>
@@ -22,6 +23,7 @@
 #include <key_io.h>
 #include <net.h>
 #include <node/context.h>
+#include <node/cpuminer.h>
 #include <node/miner.h>
 #include <node/warnings.h>
 #include <policy/ephemeral_policy.h>
@@ -262,6 +264,79 @@ static RPCHelpMan generate()
     }};
 }
 
+static RPCHelpMan setgenerate()
+{
+    return RPCHelpMan{"setgenerate",
+        "\nTurn the built-in CPU miner on or off.\n"
+        "Blocks found by the miner pay the block reward to the given address (or -miningaddress).\n"
+        "This miner is meant for regtest, signet and testnet. On mainnet a CPU has no realistic chance of\n"
+        "finding a block; use getblocktemplate with an external miner or the DATUM Gateway (contrib/datum).\n",
+        {
+            {"generate", RPCArg::Type::BOOL, RPCArg::Optional::NO, "True to start mining, false to stop."},
+            {"genproclimit", RPCArg::Type::NUM, RPCArg::Default{node::DEFAULT_GENPROCLIMIT}, "Number of mining threads; -1 uses one per hardware thread. Ignored when stopping."},
+            {"address", RPCArg::Type::STR, RPCArg::DefaultHint{"-miningaddress"}, "The address that receives the block reward. Required when generate is true and -miningaddress is not set."},
+        },
+        RPCResult{RPCResult::Type::NONE, "", ""},
+        RPCExamples{
+            "\nStart mining with 4 threads\n"
+            + HelpExampleCli("setgenerate", "true 4 \"myaddress\"")
+            + "\nStop mining\n"
+            + HelpExampleCli("setgenerate", "false")
+            + "\nAs a JSON-RPC call\n"
+            + HelpExampleRpc("setgenerate", "true, 1, \"myaddress\"")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    static Mutex g_cpu_miner_mutex;
+    node::NodeContext& node = EnsureAnyNodeContext(request.context);
+    ChainstateManager& chainman = EnsureChainman(node);
+    const bool generate{self.Arg<bool>("generate")};
+
+    LOCK(g_cpu_miner_mutex);
+    if (!generate) {
+        if (node.cpu_miner) node.cpu_miner->Stop();
+        return UniValue::VNULL;
+    }
+
+    std::string address{request.params[2].isNull() ? node.args->GetArg("-miningaddress", "") : request.params[2].get_str()};
+    if (address.empty()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "No mining address: pass one as the third argument or start with -miningaddress");
+    }
+    const CTxDestination destination{DecodeDestination(address)};
+    if (!IsValidDestination(destination)) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Error: Invalid address");
+    }
+
+    int threads{node::DEFAULT_GENPROCLIMIT};
+    if (!request.params[1].isNull()) threads = self.Arg<int>("genproclimit");
+    if (threads < -1) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "genproclimit must be -1 (all hardware threads) or a positive number");
+    }
+
+    if (!node.cpu_miner) {
+        node.cpu_miner = std::make_unique<node::CpuMiner>(chainman, *CHECK_NONFATAL(node.mining));
+    }
+    node.cpu_miner->Start(threads, GetScriptForDestination(destination));
+    return UniValue::VNULL;
+},
+    };
+}
+
+static RPCHelpMan gethashespersec()
+{
+    return RPCHelpMan{"gethashespersec",
+        "\nReturns a recent hashes per second performance measurement of the built-in CPU miner (0 when it is stopped).\n",
+        {},
+        RPCResult{RPCResult::Type::NUM, "", "The hashes per second of the built-in CPU miner"},
+        RPCExamples{HelpExampleCli("gethashespersec", "") + HelpExampleRpc("gethashespersec", "")},
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    node::NodeContext& node = EnsureAnyNodeContext(request.context);
+    return node.cpu_miner ? node.cpu_miner->HashesPerSec() : 0.0;
+},
+    };
+}
+
 static RPCHelpMan generatetoaddress()
 {
     return RPCHelpMan{"generatetoaddress",
@@ -431,6 +506,9 @@ static RPCHelpMan getmininginfo()
                         {RPCResult::Type::STR_HEX, "target", "The current target"},
                         {RPCResult::Type::NUM, "networkhashps", "The network hashes per second"},
                         {RPCResult::Type::NUM, "pooledtx", "The size of the mempool"},
+                        {RPCResult::Type::BOOL, "generate", "Whether the built-in CPU miner is running (see setgenerate)"},
+                        {RPCResult::Type::NUM, "genproclimit", "Number of threads used by the built-in CPU miner (0 when stopped)"},
+                        {RPCResult::Type::NUM, "hashespersec", "Hashes per second of the built-in CPU miner"},
                         {RPCResult::Type::STR, "chain", "current network name (" LIST_CHAIN_NAMES ")"},
                         {RPCResult::Type::STR_HEX, "signet_challenge", /*optional=*/true, "The block challenge (aka. block script), in hexadecimal (only present if the current network is a signet)"},
                         {RPCResult::Type::OBJ, "next", "The next block",
@@ -472,6 +550,13 @@ static RPCHelpMan getmininginfo()
     obj.pushKV("target", GetTarget(tip, chainman.GetConsensus().powLimit).GetHex());
     obj.pushKV("networkhashps",    getnetworkhashps().HandleRequest(request));
     obj.pushKV("pooledtx",         (uint64_t)mempool.size());
+    {
+        const node::NodeContext& node_ctx = EnsureAnyNodeContext(request.context);
+        const bool cpu_mining{node_ctx.cpu_miner && node_ctx.cpu_miner->IsRunning()};
+        obj.pushKV("generate", cpu_mining);
+        obj.pushKV("genproclimit", cpu_mining ? node_ctx.cpu_miner->Threads() : 0);
+        obj.pushKV("hashespersec", cpu_mining ? node_ctx.cpu_miner->HashesPerSec() : 0.0);
+    }
     obj.pushKV("chain", chainman.GetParams().GetChainTypeString());
 
     UniValue next(UniValue::VOBJ);
@@ -1224,6 +1309,9 @@ void RegisterMiningRPCCommands(CRPCTable& t)
         {"mining", &getblocktemplate},
         {"mining", &submitblock},
         {"mining", &submitheader},
+
+        {"mining", &setgenerate},
+        {"mining", &gethashespersec},
 
         {"hidden", &generatetoaddress},
         {"hidden", &generatetodescriptor},
