@@ -1,0 +1,33 @@
+# Bitcoin Knots settings recommended for running the DATUM Gateway
+# (https://github.com/OCEAN-xyz/datum_gateway) against this node.
+#
+# Copy the lines you need into your bitcoin.conf. Everything marked "default"
+# is already the Knots default in this version and is listed for clarity.
+
+# --- RPC access for the gateway -------------------------------------------
+# The gateway pulls block templates over getblocktemplate. Use the same
+# credentials in datum_gateway_config.json. contrib/datum/setup-datum.sh
+# generates a random password for you.
+server=1
+rpcuser=datum
+rpcpassword=CHANGE_ME
+# Only needed when the gateway runs on another machine/container:
+#rpcbind=0.0.0.0
+#rpcallowip=192.168.0.0/16
+
+# --- Block space reserved for the pool's generation transaction -----------
+# DATUM places the pool-provided payout outputs in the coinbase, so the node
+# must leave room for them (default).
+blockmaxsize=3985000
+blockmaxweight=3985000
+
+# --- Mempool / compact block reconstruction (default) ---------------------
+maxmempool=1000
+blockreconstructionextratxn=1000000
+
+# --- Stale work prevention -------------------------------------------------
+# Tell the gateway immediately when a new block arrives. Not needed if
+# notify_fallback is true in the gateway config (slower, polling based).
+blocknotify=killall -USR1 datum_gateway
+# Docker variant:
+#blocknotify=wget -q -O /dev/null http://datum-gateway:7152/NOTIFY

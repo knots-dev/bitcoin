@@ -24,14 +24,16 @@ namespace kernel {
 struct MemPoolOptions;
 };
 
-/** Default for -blockmaxsize, which controls the maximum size of block the mining code will create **/
-static const unsigned int DEFAULT_BLOCK_MAX_SIZE = 300000;
+/** Default for -blockmaxsize, which controls the maximum size of block the mining code will create.
+ *  3985000 leaves ~15 kB of the 4,000,000 byte/WU limit free for the pool-supplied generation
+ *  transaction that the DATUM Gateway (and similar pool software) builds into the template. **/
+static const unsigned int DEFAULT_BLOCK_MAX_SIZE = 3985000;
 /** Default for -blockprioritysize, maximum space for zero/low-fee transactions **/
 static const unsigned int DEFAULT_BLOCK_PRIORITY_SIZE = 100000;
 /** Minimum priority for transactions to be accepted into the priority area **/
 static const double MINIMUM_TX_PRIORITY = COIN * 144 / 250;
 /** Default for -blockmaxweight, which controls the range of block weights the mining code will create **/
-static constexpr unsigned int DEFAULT_BLOCK_MAX_WEIGHT{DEFAULT_BLOCK_MAX_SIZE * WITNESS_SCALE_FACTOR};
+static constexpr unsigned int DEFAULT_BLOCK_MAX_WEIGHT{3985000};
 /** Default for BlockCreateOptions.block_reserved_size **/
 static constexpr unsigned int DEFAULT_BLOCK_RESERVED_SIZE{1000};
 /** Default for -blockreservedweight **/

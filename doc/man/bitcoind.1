@@ -54,7 +54,7 @@ block hash)
 \fB\-blockreconstructionextratxn=\fR<n>
 .IP
 Extra transactions to keep in memory for compact block reconstructions
-(default: 32768)
+(default: 1000000)
 .HP
 \fB\-blockreconstructionextratxnsize=\fR<n>
 .IP
@@ -146,7 +146,7 @@ disable, default: 0)
 .HP
 \fB\-maxmempool=\fR<n>
 .IP
-Keep the transaction memory pool below <n> megabytes (default: 300)
+Keep the transaction memory pool below <n> megabytes (default: 1000)
 .HP
 \fB\-maxorphantx=\fR<n>
 .IP
@@ -932,11 +932,11 @@ Block creation options:
 .HP
 \fB\-blockmaxsize=\fR<n>
 .IP
-Set maximum block size in bytes (default: 300000)
+Set maximum block size in bytes (default: 3985000)
 .HP
 \fB\-blockmaxweight=\fR<n>
 .IP
-Set maximum BIP141 block weight (default: 1200000)
+Set maximum BIP141 block weight (default: 3985000)
 .HP
 \fB\-blockmintxfee=\fR<amt>
 .IP
