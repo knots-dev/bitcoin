@@ -17,6 +17,7 @@
 #include <chainparamsbase.h>
 #include <clientversion.h>
 #include <common/args.h>
+#include <common/sighash_rules.h>
 #include <common/pcp.h>
 #include <common/system.h>
 #include <consensus/amount.h>
@@ -37,7 +38,6 @@
 #include <interfaces/node.h>
 #include <ipc/exception.h>
 #include <kernel/caches.h>
-#include <kernel/chainparams.h>
 #include <kernel/context.h>
 #include <kernel/warning.h>
 #include <key.h>
@@ -501,6 +501,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
                              kernel::DEFAULT_XOR_BLOCKSDIR),
                    ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-fastprune", "Use smaller block files and lower minimum prune height for testing purposes", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    SetupSighashRulesArgs(argsman);
 #if HAVE_SYSTEM
     argsman.AddArg("-blocknotify=<cmd>", "Execute command when the best block changes (%s in cmd is replaced by block hash)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
 #endif
@@ -575,7 +576,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-listen", strprintf("Accept connections from outside (default: %u if no -proxy, -connect or -maxconnections=0)", DEFAULT_LISTEN), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-listenonion", strprintf("Automatically create Tor onion service (default: %d)", DEFAULT_LISTEN_ONION), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-maxconnections=<n>", strprintf("Maintain at most <n> automatic connections to peers (default: %u). This limit does not apply to connections manually added via -addnode or the addnode RPC, which have a separate limit of %u.", DEFAULT_MAX_PEER_CONNECTIONS, MAX_ADDNODE_CONNECTIONS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
-    argsman.AddArg("-maxstaleoutbound=<n>", strprintf("Tolerate at most <n> automatic outbound connections to peers running stale consensus rules (default: %u). This limit does not apply to connections manually added via -addnode or the addnode RPC. Connections to full nodes will still be sought and preferred over stale ones.", DEFAULT_MAXSTALEOUTBOUND), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-maxstaleoutbound=<n>", strprintf("Tolerate at most <n> automatic outbound connections to peers running stale consensus rules (maximum: %u, default: %u). These are additional to the automatic outbound target but count within the -maxconnections limit. This limit does not apply to connections manually added via -addnode or the addnode RPC. Connections to full nodes will still be sought and preferred over stale ones.", MAX_STALE_OUTBOUND_CONNECTIONS, DEFAULT_MAXSTALEOUTBOUND), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-maxreceivebuffer=<n>", strprintf("Maximum per-connection receive buffer, <n>*1000 bytes (default: %u)", DEFAULT_MAXRECEIVEBUFFER), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-maxsendbuffer=<n>", strprintf("Maximum per-connection memory usage for the send buffer, <n>*1000 bytes (default: %u)", DEFAULT_MAXSENDBUFFER), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-maxuploadtarget=<n>", strprintf("Tries to keep outbound traffic under the given target per 24h. Limit does not apply to peers with 'download' permission or blocks created within past week. 0 = no limit (default: %s). Optional suffix units [k|K|m|M|g|G|t|T] (default: M). Lowercase is 1000 base while uppercase is 1024 base", DEFAULT_MAX_UPLOAD_TARGET), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
@@ -588,7 +589,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-i2pacceptincoming", strprintf("Whether to accept inbound I2P connections (default: %i). Ignored if -i2psam is not set. Listening for inbound I2P connections is done through the SAM proxy, not by binding to a local address and port.", DEFAULT_I2P_ACCEPT_INCOMING), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-onlynet=<net>", "Make automatic outbound connections only to network <net> (" + Join(GetNetworkNames(), ", ") + "). Inbound and manual connections are not affected by this option. It can be specified multiple times to allow multiple networks.", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-v2transport", strprintf("Support v2 transport (default: %u)", DEFAULT_V2_TRANSPORT), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
-    argsman.AddArg("-v2onlyclearnet", strprintf("Disallow outbound v1 connections on IPV4/IPV6 (default: %u). Enable this option only if you really need it. Use -listen=0 to disable inbound connections since they can be unencrypted.", false), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-v2onlyclearnet", strprintf("Require v2 transport (BIP324) for connections with IPv4/IPv6 peers (default: %u). Outbound connections to v1-only clearnet peers are not attempted and inbound v1 connections from clearnet peers are disconnected. Tor/I2P/CJDNS peers are unaffected, being encrypted already. Requires -v2transport=1. Enable this only if passive on-path observers such as your ISP are a concern. Note: this encrypts message contents; it does not hide that you are running a Bitcoin node, which the default port (8333) and traffic patterns still reveal.", DEFAULT_V2_ONLY_CLEARNET), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-peerbloomfilters", strprintf("Support filtering of blocks and transactions with bloom filters (default: %s)", DEFAULT_PEERBLOOMFILTERS ? "1" : "localhost only"), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-peerblockfilters", strprintf("Serve compact block filters to peers per BIP 157 (default: %u)", DEFAULT_PEERBLOCKFILTERS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-txreconciliation", strprintf("Enable transaction reconciliations per BIP 330 (default: %d)", DEFAULT_TXRECONCILIATION_ENABLE), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CONNECTION);
@@ -702,13 +703,13 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-uaspoof=<ua>", strprintf("Replace entire user agent string with custom identifier (should be formatted '%s' as specified in BIP 14)", BIP14_EXAMPLE_UA), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CONNECTION);
 
     SetupChainParamsBaseOptions(argsman);
-    argsman.AddArg("-consensusrules=<rules>", strprintf("Enforce the specified consensus rules (default: none). Must be %s to use this software.", CONSENSUSRULES_REQUIRED), ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
-    argsman.AddArg("-rdts_consent_flag=<n>", strprintf("Test RDTS consent flag <n> (default: %u)", static_cast<int64_t>(g_rdts_consent)), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-consensusrules=<rules>", "Enforce the specified consensus rules (default: none).", ArgsManager::ALLOW_ANY, OptionsCategory::CHAINPARAMS);
 
     argsman.AddArg("-acceptnonstddatacarrier",
                    strprintf("Relay and mine non-OP_RETURN datacarrier injection (default: %u)",
                              DEFAULT_ACCEPT_NON_STD_DATACARRIER),
                    ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
+    argsman.AddArg("-rejectbpub", strprintf("Count the witness scripts of inputs that carry a BPUB file as non-standard data carrier bytes (default: %u)", DEFAULT_REJECT_BPUB), ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-acceptnonstdtxn", strprintf("Relay and mine \"non-standard\" transactions (default: %u)", DEFAULT_ACCEPT_NON_STD_TXN), ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-acceptunknownwitness",
                    strprintf("Relay transactions sending to unknown/future witness script versions (default: %u)", DEFAULT_ACCEPTUNKNOWNWITNESS),
@@ -725,6 +726,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-bytespersigopstrict", strprintf("Minimum bytes per sigop in transactions we relay and mine (default: %u)", DEFAULT_BYTES_PER_SIGOP_STRICT), ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-datacarrier", strprintf("Relay and mine data carrier transactions (default: %u)", DEFAULT_ACCEPT_DATACARRIER), ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-datacarriercost", strprintf("Treat extra data in transactions as at least N vbytes per actual byte (default: %s)", DEFAULT_WEIGHT_PER_DATA_BYTE / 4.0), ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
+    argsman.AddArg("-rejectdeadbranches", strprintf("Count data in a conditional branch that a pushed constant makes unreachable as data carrier bytes; the OP_FALSE OP_IF envelope is counted either way (default: %u)", DEFAULT_REJECT_DEAD_BRANCHES), ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);
     argsman.AddArg("-datacarrierfullcount", strprintf("Apply datacarriersize limit to all known datacarrier methods (default: %u)", DEFAULT_DATACARRIER_FULLCOUNT), ArgsManager::ALLOW_ANY | (DEFAULT_DATACARRIER_FULLCOUNT ? uint32_t{ArgsManager::DEBUG_ONLY} : 0), OptionsCategory::NODE_RELAY);
     argsman.AddArg("-datacarriersize",
                    strprintf("Maximum size of data in data carrier transactions we relay and mine, in bytes (maximum %s, default: %u)",
@@ -784,7 +786,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-blockmaxweight=<n>", strprintf("Set maximum BIP141 block weight (default: %d)", DEFAULT_BLOCK_MAX_WEIGHT), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
     argsman.AddArg("-blockreservedweight=<n>", strprintf("Reserve space for the fixed-size block header plus the largest coinbase transaction the mining software may add to the block. (default: %d).", DEFAULT_BLOCK_RESERVED_WEIGHT), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
     argsman.AddArg("-blockmintxfee=<amt>", strprintf("Set lowest fee rate (in %s/kvB) for transactions to be included in block creation. (default: %s)", CURRENCY_UNIT, FormatMoney(DEFAULT_BLOCK_MIN_TX_FEE)), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
-    argsman.AddArg("-blockprioritysize=<n>", strprintf("Set maximum size of high-priority/low-fee transactions in bytes (default: %d)", DEFAULT_BLOCK_PRIORITY_SIZE), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
+    argsman.AddArg("-blockprioritysize=<n>", strprintf("Set maximum size in bytes reserved for coin-age priority transactions meeting the mining fee floor (default: %d)", DEFAULT_BLOCK_PRIORITY_SIZE), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
     argsman.AddArg("-blockversion=<n>", "Override block version to test forking scenarios", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::BLOCK_CREATION);
 
     argsman.AddArg("-rest", strprintf("Accept public REST requests (default: %u)", DEFAULT_REST_ENABLE), ArgsManager::ALLOW_ANY, OptionsCategory::RPC);
@@ -874,9 +876,11 @@ void InitParameterInteraction(ArgsManager& args)
         args.SoftSetArg("-permitbarepubkey", "1");
         args.SoftSetArg("-permitbaremultisig", "1");
         args.SoftSetArg("-rejectparasites", "0");
+        args.SoftSetArg("-rejecttokens", "0");
         args.SoftSetArg("-subdustfeepenalty", "0");
         args.SoftSetArg("-datacarriercost", "0.25");
         args.SoftSetArg("-datacarrierfullcount", "0");
+        args.SoftSetArg("-rejectdeadbranches", "0");
         args.SoftSetArg("-maxtxlegacysigops", strprintf("%s", std::numeric_limits<unsigned int>::max()));
         args.SoftSetArg("-maxscriptsize", strprintf("%s", std::numeric_limits<unsigned int>::max()));
         args.SoftSetArg("-mempooltruc", "enforce");
@@ -967,7 +971,7 @@ void InitParameterInteraction(ArgsManager& args)
     if (!onlynets.empty()) {
         bool clearnet_reachable = std::any_of(onlynets.begin(), onlynets.end(), [](const auto& net) {
             const auto n = ParseNetwork(net);
-            return n == NET_IPV4 || n == NET_IPV6;
+            return IsClearnet(n);
         });
         if (!clearnet_reachable && args.SoftSetBoolArg("-dnsseed", false)) {
             LogInfo("parameter interaction: -onlynet excludes IPv4 and IPv6 -> setting -dnsseed=0\n");
@@ -991,7 +995,7 @@ namespace { // Variables internal to initialization process only
 
 int nMaxConnections;
 int available_fds;
-ServiceFlags g_local_services = ServiceFlags(NODE_NETWORK_LIMITED | NODE_WITNESS | NODE_REDUCED_DATA);
+ServiceFlags g_local_services = ServiceFlags(NODE_NETWORK_LIMITED | NODE_WITNESS | NODE_BLAKE2B);
 int64_t peer_connect_timeout;
 std::set<BlockFilterType> g_enabled_filter_types;
 
@@ -1107,7 +1111,7 @@ bool AppInitParameterInteraction(const ArgsManager& args)
     // Signal NODE_P2P_V2 if BIP324 v2 transport is enabled.
     if (args.GetBoolArg("-v2transport", DEFAULT_V2_TRANSPORT)) {
         g_local_services = ServiceFlags(g_local_services | NODE_P2P_V2);
-    } else if (args.GetBoolArg("-v2onlyclearnet", false)) {
+    } else if (args.GetBoolArg("-v2onlyclearnet", DEFAULT_V2_ONLY_CLEARNET)) {
         return InitError(_("Cannot set -v2onlyclearnet to true when v2transport is disabled."));
     }
 
@@ -1209,13 +1213,19 @@ bool AppInitParameterInteraction(const ArgsManager& args)
         if (block_reserved_weight < MINIMUM_BLOCK_RESERVED_WEIGHT) {
             return InitError(strprintf(_("Specified -blockreservedweight (%d) is lower than minimum safety value of (%d)"), block_reserved_weight, MINIMUM_BLOCK_RESERVED_WEIGHT));
         }
+        if (block_reserved_weight > REDUCED_DATA_MAX_BLOCK_WEIGHT) {
+            InitWarning(strprintf(_("Specified -blockreservedweight (%d) exceeds the block weight limit that applies while RDTS is active (%d); block templates will contain no transactions while that limit applies"), block_reserved_weight, REDUCED_DATA_MAX_BLOCK_WEIGHT));
+        }
     }
 
     if (auto parsed = args.GetFixedPointArg("-datacarriercost", 2)) {
         g_weight_per_data_byte = ((*parsed * WITNESS_SCALE_FACTOR) + 99) / 100;
     }
+    g_reject_bpub = args.GetBoolArg("-rejectbpub", DEFAULT_REJECT_BPUB);
 
     g_script_size_policy_limit = args.GetIntArg("-maxscriptsize", g_script_size_policy_limit);
+
+    g_reject_dead_branches = args.GetBoolArg("-rejectdeadbranches", g_reject_dead_branches);
 
     nBytesPerSigOp = args.GetIntArg("-bytespersigop", nBytesPerSigOp);
     nBytesPerSigOpStrict = args.GetIntArg("-bytespersigopstrict", nBytesPerSigOpStrict);
@@ -1380,7 +1390,10 @@ static void SyncCoinsTipAfterChainSync(const NodeContext& node)
     }
 
     LogDebug(BCLog::COINDB, "Finished syncing to tip, syncing chainstate to disk\n");
-    node.chainman->ActiveChainstate().CoinsTip().Sync();
+    // Persist block/undo data and the block index before the coins database.
+    // An interrupted coins batch needs those entries to replay during recovery.
+    BlockValidationState state;
+    node.chainman->ActiveChainstate().FlushStateToDisk(state, FlushStateMode::FORCE_SYNC);
 }
 
 bool AppInitInterfaces(NodeContext& node)
@@ -1562,6 +1575,14 @@ static ChainstateLoadResult InitAndLoadChainstate(
     };
     auto [status, error] = catch_exceptions([&] { return LoadChainstate(chainman, cache_sizes, options); });
     if (status == node::ChainstateLoadStatus::SUCCESS) {
+        if (!ShutdownRequested(node) && !chainman.GetConsensus().chainstate_revalidation_deployments.empty()) {
+            uiInterface.InitMessage(_("Revalidating blocks…"));
+            bilingual_str revalidation_error;
+            if (!chainman.ActiveChainstate().RewindForChainstateRevalidation(revalidation_error)) {
+                return {node::ChainstateLoadStatus::FAILURE, revalidation_error};
+            }
+        }
+
         uiInterface.InitMessage(_("Verifying blocks…"));
         if (chainman.m_blockman.m_have_pruned && options.check_blocks > MIN_BLOCKS_TO_KEEP) {
             LogWarning("pruned datadir may not have more than %d blocks; only checking available blocks\n",
@@ -1577,80 +1598,12 @@ static ChainstateLoadResult InitAndLoadChainstate(
 
 bool UserProtocolRulesCheck()
 {
-    const auto rules_requested{gArgs.GetArgs(CONSENSUSRULES_CONFIG_NAME)};
-    for (const auto& rulesok : rules_requested) {
-        if (rulesok == CONSENSUSRULES_REQUIRED) continue;
-        return InitError(strprintf(_("Unknown rule specified in -%s: %s"), CONSENSUSRULES_CONFIG_NAME, rulesok));
+    for (const auto& rule : gArgs.GetArgs(CONSENSUSRULES_CONFIG_NAME)) {
+        // Accepted and ignored: configurations written while RDTS consent was required still carry it
+        if (rule == "rdts") continue;
+        return InitError(strprintf(_("Unknown rule specified in -%s: %s"), CONSENSUSRULES_CONFIG_NAME, rule));
     }
     return true;
-}
-
-bool UserProtocolRulesConsent()
-{
-    if (g_rdts_consent == RDTSConsentFlag::IMPLICIT) {
-        LogPrintf("User already consented to '%s' consensus rules (at installation)\n", CONSENSUSRULES_REQUIRED);
-        return true;
-    }
-    for (const auto& rulesok : gArgs.GetArgs(CONSENSUSRULES_CONFIG_NAME)) {
-        if (rulesok == CONSENSUSRULES_REQUIRED) {
-            LogPrintf("User already consented to '%s' consensus rules (in config)\n", CONSENSUSRULES_REQUIRED);
-            return true;
-        }
-    }
-
-    bilingual_str msg = strprintf(_(
-        "BIP110/RDTS Network Upgrade\n"
-        "\n"
-        "This version of %s applies the BIP110 (RDTS) network upgrade, "
-        "which fixes critical vulnerabilities in long-standing network design. "
-        "However, you are in control of your own software, and this application asks for explicit confirmation.\n"
-        "\n"
-        "Important: "
-        "Because this upgrade already has broad community support, "
-        "reverting to an older software version does not reject it. "
-        "Running outdated software after any network upgrade only leaves your node vulnerable to displaying fake or fraudulent transactions. "
-        "To effectively reject this upgrade, you need to run alternative software designed to split away from the upgraded network.\n"
-        "\n"
-        "For more information, see: %s"
-    ),
-        CLIENT_NAME,
-        "https://bitcoinknots.org/learn/2026-rdts");
-    const bilingual_str msg_manual_suffix = strprintf(_(
-        "To confirm this upgrade, add to your %s file: %s"
-    ),
-        gArgs.GetPathArg("-conf", BITCOIN_CONF_FILENAME).utf8string(),
-        CONSENSUSRULES_CONFIG_NAME + "=" + CONSENSUSRULES_REQUIRED);
-    const bilingual_str msg_manual = msg + Untranslated("\n\n") + msg_manual_suffix;
-
-    if (!gArgs.GetSettingsPath()) {
-        msg = msg_manual;
-    }
-
-    const bool consent = uiInterface.ThreadSafeQuestion(
-        _("Attention:") + Untranslated(" ") + msg,
-        msg_manual.original
-        , "Attention", CClientUIInterface::MSG_WARNING | CClientUIInterface::BTN_ABORT);
-
-    if (consent) {
-        if (gArgs.GetSettingsPath()) {
-            // Write to settings.json so we don't ask anymore
-            LogPrintf("User interactively consented to '%s' consensus rules (%s)\n", CONSENSUSRULES_REQUIRED, "remembering for next time");
-            gArgs.LockSettings([&](common::Settings& settings) {
-                auto& setting = settings.rw_settings[CONSENSUSRULES_CONFIG_NAME];
-                if (setting.isArray()) {
-                    // Normally, it doesn't make sense to support multiple rulesets, but if the user has done so already, don't lose the current set
-                    setting.push_back(CONSENSUSRULES_REQUIRED);
-                } else {
-                    setting = CONSENSUSRULES_REQUIRED;
-                }
-            });
-            gArgs.WriteSettingsFile();
-        } else {
-            LogPrintf("User interactively consented to '%s' consensus rules (%s)\n", CONSENSUSRULES_REQUIRED, "settings disabled, so can't save");
-        }
-    }
-
-    return consent;
 }
 
 bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
@@ -1729,32 +1682,6 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     if (!UserProtocolRulesCheck()) {
         return false;
-    }
-
-    if (!(chainparams.IsTestChain() || UserProtocolRulesConsent())) {
-        if (g_rdts_consent == RDTSConsentFlag::RUNTIME_CHECK) {
-            return InitError(_("User has not consented to supported protocol rules. Exiting"));
-        } else if (g_rdts_consent == RDTSConsentFlag::UNSUPPORTED_UNSAFE_NO_ENFORCEMENT) {
-            LogError("User has not consented to supported protocol rules. This node will NOT enforce them. Warning every hour.");
-            g_local_services = ServiceFlags(g_local_services & ~NODE_REDUCED_DATA);
-            scheduler.scheduleEvery([]{
-                LogError("RDTS is not enabled. This node is therefore vulnerable to displaying fake or fraudulent transactions.\n");
-                LogError("For more information, see: %s\n", "https://bitcoinknots.org/learn/2026-rdts");
-                LogError("To enable RDTS enforcement and disable this warning, add to %s: %s\n",
-                    gArgs.GetPathArg("-conf", BITCOIN_CONF_FILENAME).utf8string(),
-                    CONSENSUSRULES_CONFIG_NAME + "=" + CONSENSUSRULES_REQUIRED);
-            }, std::chrono::hours{1});
-        } else {
-            LogError("User has not consented to supported protocol rules. This node will STILL enforce them. Warning every hour.");
-            g_rdts_warning = true;
-            scheduler.scheduleEvery([]{
-                LogError("This software applies the BIP110/RDTS network upgrade, which fixes critical vulnerabilities, but explicit user confirmation has not been configured.\n");
-                LogError("For more information, see: %s\n", "https://bitcoinknots.org/learn/2026-rdts");
-                LogError("To confirm this upgrade and dismiss this warning, add to your %s file: %s\n",
-                    gArgs.GetPathArg("-conf", BITCOIN_CONF_FILENAME).utf8string(),
-                    CONSENSUSRULES_CONFIG_NAME + "=" + CONSENSUSRULES_REQUIRED);
-            }, std::chrono::hours{1});
-        }
     }
 
     if (interfaces::Ipc* ipc = node.init->ipc()) {
@@ -2109,6 +2036,37 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         do_reindex_chainstate,
         kernel_cache_sizes,
         args);
+
+    // A data directory advanced by a client that was not enforcing the
+    // BLAKE2b hardfork can contain SHA256d blocks at or above the fork height.
+    // Normal startup does not re-validate inherited history, so correct such
+    // state now: mark the offending blocks invalid and reorganize to the best
+    // valid chain (the BLAKE2b chain, which extends past the last shared
+    // pre-fork block, then outweighs the truncated inherited branch). If the
+    // data needed to rewind has been pruned, report it as a load failure so
+    // the reindex prompt below offers recovery, rather than running on (or
+    // partially rewinding) an invalid chain.
+    //
+    // Skip this on any reindex: both -reindex and -reindex-chainstate reconnect
+    // blocks through ConnectBlock, which re-runs the bad-version-blake2b header
+    // check (it is contextual/volatile) and rejects the offending blocks during
+    // the rebuild, so the correction is redundant. The same holds whenever the
+    // active chain has not been built yet (a coins database with no best block,
+    // reindex or not); the correction itself is a no-op in that state.
+    //
+    // The block index is shared, so the invalid marks apply to any background
+    // (assumeutxo) chainstate too; only the active chainstate is reorganized here.
+    // Safe while every snapshot base stays below the BLAKE2b fork height (as
+    // today); a future snapshot base above it would need re-review.
+    if (status == ChainstateLoadStatus::SUCCESS && !ShutdownRequested(node) &&
+            !do_reindex && !do_reindex_chainstate) {
+        bilingual_str rdts_error;
+        if (!node.chainman->ActiveChainstate().CorrectRdtsInvalidBlocks(rdts_error)) {
+            status = ChainstateLoadStatus::FAILURE;
+            error = rdts_error;
+        }
+    }
+
     if (status == ChainstateLoadStatus::FAILURE && !do_reindex && !ShutdownRequested(node)) {
         // If reindex=auto, directly start the reindex
         bool fAutoReindex = (args.GetArg("-reindex", "0") == "auto");
@@ -2118,7 +2076,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             do_retry = HasTestOption(args, "reindex_after_failure_noninteractive_yes") ||
             uiInterface.ThreadSafeQuestion(
             error + Untranslated(".\n\n") + _("Do you want to rebuild the databases now?"),
-            error.original + ".\nPlease restart with -reindex or -reindex-chainstate to recover.",
+            error.original + (args.GetIntArg("-prune", 0) ? ".\nPlease restart with -reindex to recover." : ".\nPlease restart with -reindex or -reindex-chainstate to recover."),
             "", CClientUIInterface::MSG_ERROR | CClientUIInterface::BTN_ABORT);
         } else {
             LogPrintf("Automatically running a reindex.\n");
@@ -2261,10 +2219,16 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         vImportFiles.push_back(fs::PathFromString(strFile));
     }
 
-    node.background_init_thread = std::thread(&util::TraceThread, "initload", [=, &chainman, &args, &node] {
+    node.background_init_thread = std::thread(&util::TraceThread, "initload", [=, &chainman, &args, &kernel_notifications, &node] {
         ScheduleBatchPriority();
         // Import blocks and ActivateBestChain()
         ImportBlocks(chainman, vImportFiles);
+        // An interrupted import may return without activating genesis. Wake
+        // the init thread's genesis wait, which is otherwise only notified
+        // on blockTip, and that never fires when the import was interrupted
+        // before activating genesis. This wakeup lets the wait observe the
+        // shutdown request.
+        WITH_LOCK(kernel_notifications.m_tip_block_mutex, kernel_notifications.m_tip_block_cv.notify_all());
         WITH_LOCK(::cs_main, chainman.UpdateIBDStatus());
         if (args.GetBoolArg("-stopafterblockimport", DEFAULT_STOPAFTERBLOCKIMPORT)) {
             LogPrintf("Stopping after block import\n");
@@ -2350,7 +2314,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     connOptions.whitelist_forcerelay = args.GetBoolArg("-whitelistforcerelay", DEFAULT_WHITELISTFORCERELAY);
     connOptions.whitelist_relay = args.GetBoolArg("-whitelistrelay", DEFAULT_WHITELISTRELAY);
     connOptions.m_capture_messages = args.GetBoolArg("-capturemessages", false);
-    connOptions.disable_v1conn_clearnet = args.GetBoolArg("-v2onlyclearnet", false);
+    connOptions.m_v2only_clearnet = args.GetBoolArg("-v2onlyclearnet", DEFAULT_V2_ONLY_CLEARNET);
 
     // Port to bind to if `-bind=addr` is provided without a `:port` suffix.
     const uint16_t default_bind_port =

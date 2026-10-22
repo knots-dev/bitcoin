@@ -124,6 +124,7 @@ enum BlockStatus : uint32_t {
     BLOCK_HAVE_DATA          =    8, //!< full block available in blk*.dat
     BLOCK_HAVE_UNDO          =   16, //!< undo data available in rev*.dat
     BLOCK_HAVE_MASK          =   BLOCK_HAVE_DATA | BLOCK_HAVE_UNDO,
+    BLOCK_CAN_REWIND         =   BLOCK_HAVE_DATA | BLOCK_HAVE_UNDO,
 
     BLOCK_FAILED_VALID       =   32, //!< stage after last reached validness failed
     BLOCK_FAILED_CHILD       =   64, //!< descends from failed block
@@ -140,7 +141,7 @@ enum BlockStatus : uint32_t {
  * candidates to be the next block. A blockindex may have multiple pprev pointing
  * to it, but at most one of them can be part of the currently active branch.
  */
-class CBlockIndex
+class CBlockIndex : public CompressedHeader
 {
 public:
     //! pointer to the hash of the block, if any. Memory is owned by this CBlockIndex
@@ -186,13 +187,6 @@ public:
     //! @sa ActivateSnapshot
     uint32_t nStatus GUARDED_BY(::cs_main){0};
 
-    //! block header
-    int32_t nVersion{0};
-    uint256 hashMerkleRoot{};
-    uint32_t nTime{0};
-    uint32_t nBits{0};
-    uint32_t nNonce{0};
-
     //! (memory only) Sequential id assigned to distinguish order in which blocks are received.
     //! Initialized to SEQ_ID_INIT_FROM_DISK{1} when loading blocks from disk, except for blocks
     //! belonging to the best chain which overwrite it to SEQ_ID_BEST_CHAIN_FROM_DISK{0}.
@@ -202,11 +196,7 @@ public:
     unsigned int nTimeMax{0};
 
     explicit CBlockIndex(const CBlockHeader& block)
-        : nVersion{block.nVersion},
-          hashMerkleRoot{block.hashMerkleRoot},
-          nTime{block.nTime},
-          nBits{block.nBits},
-          nNonce{block.nNonce}
+        : CompressedHeader{block}
     {
     }
 
@@ -234,15 +224,7 @@ public:
 
     CBlockHeader GetBlockHeader() const
     {
-        CBlockHeader block;
-        block.nVersion = nVersion;
-        if (pprev)
-            block.hashPrevBlock = pprev->GetBlockHash();
-        block.hashMerkleRoot = hashMerkleRoot;
-        block.nTime = nTime;
-        block.nBits = nBits;
-        block.nNonce = nNonce;
-        return block;
+        return CBlockHeader(static_cast<const CompressedHeader&>(*this), pprev ? pprev->GetBlockHash() : uint256{}, nHeight);
     }
 
     uint256 GetBlockHash() const
@@ -262,16 +244,6 @@ public:
      * been set manually based on the related AssumeutxoData entry.
      */
     bool HaveNumChainTxs() const { return m_chain_tx_count != 0; }
-
-    NodeSeconds Time() const
-    {
-        return NodeSeconds{std::chrono::seconds{nTime}};
-    }
-
-    int64_t GetBlockTime() const
-    {
-        return (int64_t)nTime;
-    }
 
     int64_t GetBlockTimeMax() const
     {
@@ -379,6 +351,11 @@ public:
         hashPrev = (pprev ? pprev->GetBlockHash() : uint256());
     }
 
+    CBlockHeader GetBlockHeader() const
+    {
+        return CBlockHeader{static_cast<const CompressedHeader&>(*this), hashPrev, nHeight};
+    }
+
     SERIALIZE_METHODS(CDiskBlockIndex, obj)
     {
         LOCK(::cs_main);
@@ -393,24 +370,16 @@ public:
         if (obj.nStatus & BLOCK_HAVE_UNDO) READWRITE(VARINT(obj.nUndoPos));
 
         // block header
-        READWRITE(obj.nVersion);
-        READWRITE(obj.hashPrev);
-        READWRITE(obj.hashMerkleRoot);
-        READWRITE(obj.nTime);
-        READWRITE(obj.nBits);
-        READWRITE(obj.nNonce);
+        CBlockHeader header;
+        SER_WRITE(obj, header = obj.GetBlockHeader());
+        READWRITE(header);
+        SER_READ(obj, static_cast<CompressedHeader&>(obj) = header);
+        SER_READ(obj, obj.hashPrev = header.hashPrevBlock);
     }
 
     uint256 ConstructBlockHash() const
     {
-        CBlockHeader block;
-        block.nVersion = nVersion;
-        block.hashPrevBlock = hashPrev;
-        block.hashMerkleRoot = hashMerkleRoot;
-        block.nTime = nTime;
-        block.nBits = nBits;
-        block.nNonce = nNonce;
-        return block.GetHash();
+        return GetBlockHeader().GetHash();
     }
 
     uint256 GetBlockHash() = delete;

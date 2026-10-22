@@ -9,6 +9,7 @@
 
 #include <blockfilter.h>
 #include <chain.h>
+#include <common/sighash_rules.h>
 #include <chainparams.h>
 #include <chainparamsbase.h>
 #include <clientversion.h>
@@ -18,6 +19,7 @@
 #include <consensus/params.h>
 #include <consensus/validation.h>
 #include <core_io.h>
+#include <dbwrapper.h>
 #include <deploymentinfo.h>
 #include <deploymentstatus.h>
 #include <flatfile.h>
@@ -108,6 +110,18 @@ UniValue WriteUTXOSnapshot(
     const fs::path& path,
     const fs::path& temppath,
     const std::function<void()>& interruption_point = {});
+UniValue CreateRolledBackUTXOSnapshot(
+    node::NodeContext& node,
+    Chainstate& chainstate,
+    const CBlockIndex* target,
+    const bool is_human_readable,
+    const bool show_header,
+    const Span<const std::byte>& separator,
+    const std::vector<std::pair<std::string, coinascii_cb_t>>& requested,
+    AutoFile&& afile,
+    const fs::path& path,
+    const fs::path& tmppath,
+    const bool in_memory);
 
 /* Calculate the difficulty for a given block index.
  */
@@ -129,6 +143,20 @@ double GetDifficulty(const CBlockIndex& blockindex)
     }
 
     return dDiff;
+}
+
+double GetDifficultyBlake2b(const CBlockIndex& blockindex)
+{
+    return GetBlockProof(blockindex).getdouble();
+}
+
+void PushDifficulty(UniValue& result, const CBlockIndex& blockindex)
+{
+    if (blockindex.m_header_v2) {
+        result.pushKV("difficulty_blake2b", GetDifficultyBlake2b(blockindex));
+    } else {
+        result.pushKV("difficulty", GetDifficulty(blockindex));
+    }
 }
 
 static int ComputeNextBlockAndDepth(const CBlockIndex& tip, const CBlockIndex& blockindex, const CBlockIndex*& next)
@@ -169,6 +197,15 @@ static const CBlockIndex* ParseHashOrHeight(const UniValue& param, ChainstateMan
     }
 }
 
+//! Hex-encode a 32-bit header field in wire byte order, ie the same bytes in
+//! the same order as they appear in the serialised header.
+static std::string HeaderFieldHex(const uint32_t field)
+{
+    DataStream ss{};
+    ss << field;
+    return HexStr(ss);
+}
+
 UniValue blockheaderToJSON(const CBlockIndex& tip, const CBlockIndex& blockindex, const uint256 pow_limit)
 {
     // Serialize passed information without accessing chain state of the active chain!
@@ -188,9 +225,27 @@ UniValue blockheaderToJSON(const CBlockIndex& tip, const CBlockIndex& blockindex
     result.pushKV("nonce", blockindex.nNonce);
     result.pushKV("bits", strprintf("%08x", blockindex.nBits));
     result.pushKV("target", GetTarget(blockindex, pow_limit).GetHex());
-    result.pushKV("difficulty", GetDifficulty(blockindex));
+    PushDifficulty(result, blockindex);
     result.pushKV("chainwork", blockindex.nChainWork.GetHex());
     result.pushKV("nTx", blockindex.nTx);
+    if (blockindex.nTx > 0) {
+        result.pushKV("txcount", blockindex.nTx);
+    } else if (blockindex.m_header_v2) {
+        // The block itself hasn't been seen yet, but a v2 header commits to
+        // the number of transactions in it.
+        result.pushKV("txcount", (uint64_t)blockindex.m_txcount);
+    }
+    result.pushKV("header_version", blockindex.m_header_v2 ? 2 : 0);
+    if (blockindex.m_header_v2) {
+        result.pushKV("nonce2", HeaderFieldHex(blockindex.m_nonce2));
+        result.pushKV("nonce3", HeaderFieldHex(blockindex.m_nonce3));
+        result.pushKV("extranonce", HexStr(blockindex.m_extranonce));
+        result.pushKV("time_offset", (uint64_t)blockindex.m_time_offset);
+        result.pushKV("header_flags", blockindex.m_flags);
+        result.pushKV("xor_key_mask_clear_bits", blockindex.m_xor_key_mask_clear_bits);
+        result.pushKV("xor_key", HexStr(blockindex.m_xor_key));
+        result.pushKV("mm_rhs", HexStr(blockindex.m_mm_rhs));
+    }
 
     if (blockindex.pprev)
         result.pushKV("previousblockhash", blockindex.pprev->GetBlockHash().GetHex());
@@ -476,26 +531,6 @@ static RPCHelpMan syncwithvalidationinterfacequeue()
     };
 }
 
-static RPCHelpMan getdifficulty()
-{
-    return RPCHelpMan{"getdifficulty",
-                "\nReturns the proof-of-work difficulty as a multiple of the minimum difficulty.\n",
-                {},
-                RPCResult{
-                    RPCResult::Type::NUM, "", "the proof-of-work difficulty as a multiple of the minimum difficulty."},
-                RPCExamples{
-                    HelpExampleCli("getdifficulty", "")
-            + HelpExampleRpc("getdifficulty", "")
-                },
-        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
-{
-    ChainstateManager& chainman = EnsureAnyChainman(request.context);
-    LOCK(cs_main);
-    return GetDifficulty(*CHECK_NONFATAL(chainman.ActiveChain().Tip()));
-},
-    };
-}
-
 static RPCHelpMan getblockfrompeer()
 {
     return RPCHelpMan{
@@ -736,6 +771,9 @@ static RPCHelpMan sweepprivkeys()
             const auto& utxo = input_txos[input_index];
             SignatureData sig_data;
             MutableTransactionSignatureCreator creator(tx, input_index, utxo.nValue, &txdata, SIGHASH_ALL);
+            // A swept key is the case replay protection matters most for: it is
+            // the one most likely already known to someone else.
+            creator.SetSighashRules(SighashRulesForSigning());
             if (!ProduceSignature(temp_keystore, creator, utxo.scriptPubKey, sig_data)) {
                 throw JSONRPCError(RPC_MISC_ERROR, "Failed to sign");
             }
@@ -791,9 +829,20 @@ static RPCHelpMan getblockheader()
                             {RPCResult::Type::NUM, "nonce", "The nonce"},
                             {RPCResult::Type::STR_HEX, "bits", "nBits: compact representation of the block difficulty target"},
                             {RPCResult::Type::STR_HEX, "target", "The difficulty target"},
-                            {RPCResult::Type::NUM, "difficulty", "The difficulty"},
+                            {RPCResult::Type::NUM, "difficulty", /*optional=*/true, "The proof-of-work difficulty as a multiple of the minimum difficulty (only for SHA256d blocks)"},
+                            {RPCResult::Type::NUM, "difficulty_blake2b", /*optional=*/true, "The expected average number of BLAKE2b hashes needed to find this block (only for header-v2 blocks)"},
                             {RPCResult::Type::STR_HEX, "chainwork", "Expected number of hashes required to produce the current chain"},
-                            {RPCResult::Type::NUM, "nTx", "The number of transactions in the block"},
+                            {RPCResult::Type::NUM, "nTx", "The number of transactions in the block, or 0 if only the block header is available (DEPRECATED)"},
+                            {RPCResult::Type::NUM, "txcount", /*optional=*/true, "The number of transactions in the block; for entries where only the header has been seen this is the count committed in the v2 header, and it is omitted when unknown"},
+                            {RPCResult::Type::NUM, "header_version", "2 for a BLAKE2b v2 header, 0 otherwise"},
+                            {RPCResult::Type::STR_HEX, "nonce2", /*optional=*/true, "The second nonce, in wire byte order (only present for v2 headers)"},
+                            {RPCResult::Type::STR_HEX, "nonce3", /*optional=*/true, "The third nonce, in wire byte order (only present for v2 headers)"},
+                            {RPCResult::Type::STR_HEX, "extranonce", /*optional=*/true, "The 128-bit extranonce (only present for v2 headers)"},
+                            {RPCResult::Type::NUM, "time_offset", /*optional=*/true, "The offset subtracted from the block time on the wire, per header flags bit 2 (only present for v2 headers)"},
+                            {RPCResult::Type::NUM, "header_flags", /*optional=*/true, "The header flags: bits 0-1 ASIC profile, bit 2 time offset in use (only present for v2 headers)"},
+                            {RPCResult::Type::NUM, "xor_key_mask_clear_bits", /*optional=*/true, "The number of high bits cleared in the proof-of-work XOR mask (only present for v2 headers)"},
+                            {RPCResult::Type::STR_HEX, "xor_key", /*optional=*/true, "The 128-bit proof-of-work XOR key (only present for v2 headers)"},
+                            {RPCResult::Type::STR_HEX, "mm_rhs", /*optional=*/true, "The merge-mining hook right-hand side (only present for v2 headers)"},
                             {RPCResult::Type::STR_HEX, "previousblockhash", /*optional=*/true, "The hash of the previous block (if available)"},
                             {RPCResult::Type::STR_HEX, "nextblockhash", /*optional=*/true, "The hash of the next block (if available)"},
                         }},
@@ -970,9 +1019,20 @@ static RPCHelpMan getblock()
                     {RPCResult::Type::NUM, "nonce", "The nonce"},
                     {RPCResult::Type::STR_HEX, "bits", "nBits: compact representation of the block difficulty target"},
                     {RPCResult::Type::STR_HEX, "target", "The difficulty target"},
-                    {RPCResult::Type::NUM, "difficulty", "The difficulty"},
+                    {RPCResult::Type::NUM, "difficulty", /*optional=*/true, "The proof-of-work difficulty as a multiple of the minimum difficulty (only for SHA256d blocks)"},
+                    {RPCResult::Type::NUM, "difficulty_blake2b", /*optional=*/true, "The expected average number of BLAKE2b hashes needed to find this block (only for header-v2 blocks)"},
                     {RPCResult::Type::STR_HEX, "chainwork", "Expected number of hashes required to produce the chain up to this block (in hex)"},
-                    {RPCResult::Type::NUM, "nTx", "The number of transactions in the block"},
+                    {RPCResult::Type::NUM, "nTx", "The number of transactions in the block, or 0 if only the block header is available (DEPRECATED)"},
+                    {RPCResult::Type::NUM, "txcount", /*optional=*/true, "The number of transactions in the block; for entries where only the header has been seen this is the count committed in the v2 header, and it is omitted when unknown"},
+                    {RPCResult::Type::NUM, "header_version", "2 for a BLAKE2b v2 header, 0 otherwise"},
+                    {RPCResult::Type::STR_HEX, "nonce2", /*optional=*/true, "The second nonce, in wire byte order (only present for v2 headers)"},
+                    {RPCResult::Type::STR_HEX, "nonce3", /*optional=*/true, "The third nonce, in wire byte order (only present for v2 headers)"},
+                    {RPCResult::Type::STR_HEX, "extranonce", /*optional=*/true, "The 128-bit extranonce (only present for v2 headers)"},
+                    {RPCResult::Type::NUM, "time_offset", /*optional=*/true, "The offset subtracted from the block time on the wire, per header flags bit 2 (only present for v2 headers)"},
+                    {RPCResult::Type::NUM, "header_flags", /*optional=*/true, "The header flags: bits 0-1 ASIC profile, bit 2 time offset in use (only present for v2 headers)"},
+                    {RPCResult::Type::NUM, "xor_key_mask_clear_bits", /*optional=*/true, "The number of high bits cleared in the proof-of-work XOR mask (only present for v2 headers)"},
+                    {RPCResult::Type::STR_HEX, "xor_key", /*optional=*/true, "The 128-bit proof-of-work XOR key (only present for v2 headers)"},
+                    {RPCResult::Type::STR_HEX, "mm_rhs", /*optional=*/true, "The merge-mining hook right-hand side (only present for v2 headers)"},
                     {RPCResult::Type::STR_HEX, "previousblockhash", /*optional=*/true, "The hash of the previous block (if available)"},
                     {RPCResult::Type::STR_HEX, "nextblockhash", /*optional=*/true, "The hash of the next block (if available)"},
                 }},
@@ -1788,7 +1848,8 @@ RPCHelpMan getblockchaininfo()
                 {RPCResult::Type::STR, "bestblockhash", "the hash of the currently best block"},
                 {RPCResult::Type::STR_HEX, "bits", "nBits: compact representation of the block difficulty target"},
                 {RPCResult::Type::STR_HEX, "target", "The difficulty target"},
-                {RPCResult::Type::NUM, "difficulty", "the current difficulty"},
+                {RPCResult::Type::NUM, "difficulty", /*optional=*/true, "The proof-of-work difficulty as a multiple of the minimum difficulty (only for SHA256d blocks)"},
+                {RPCResult::Type::NUM, "difficulty_blake2b", /*optional=*/true, "The expected average number of BLAKE2b hashes needed to find the tip block (only for header-v2 blocks)"},
                 {RPCResult::Type::NUM_TIME, "time", "The block time expressed in " + UNIX_EPOCH_TIME},
                 {RPCResult::Type::NUM_TIME, "mediantime", "The median block time expressed in " + UNIX_EPOCH_TIME},
                 {RPCResult::Type::NUM, "verificationprogress", "estimate of verification progress [0..1]"},
@@ -1828,7 +1889,7 @@ RPCHelpMan getblockchaininfo()
     obj.pushKV("bestblockhash", tip.GetBlockHash().GetHex());
     obj.pushKV("bits", strprintf("%08x", tip.nBits));
     obj.pushKV("target", GetTarget(tip, chainman.GetConsensus().powLimit).GetHex());
-    obj.pushKV("difficulty", GetDifficulty(tip));
+    PushDifficulty(obj, tip);
     obj.pushKV("time", tip.GetBlockTime());
     obj.pushKV("mediantime", tip.GetMedianTimePast());
     obj.pushKV("verificationprogress", chainman.GuessVerificationProgress(&tip));
@@ -1861,10 +1922,14 @@ RPCHelpMan getblockchaininfo()
 
 namespace {
 const std::vector<RPCResult> RPCHelpForDeployment{
-    {RPCResult::Type::STR, "type", "one of \"buried\", \"bip9\""},
-    {RPCResult::Type::NUM, "height", /*optional=*/true, "height of the first block which enforces the rules (only for \"buried\" type, or \"bip9\" type with \"active\" status)"},
-    {RPCResult::Type::NUM, "height_end", /*optional=*/true, "height of the last block which enforces the rules (only for \"bip9\" type with \"active\" status and temporary deployments)"},
-    {RPCResult::Type::BOOL, "active", "true if the rules are enforced for the mempool and the next block"},
+    {RPCResult::Type::STR, "type", "one of \"buried\", \"bip9\", \"flagday\""},
+    {RPCResult::Type::NUM, "height", /*optional=*/true, "height of the first block which enforces the rules (only for \"buried\" and \"flagday\" types, or \"bip9\" type with \"active\" status)"},
+    {RPCResult::Type::NUM, "height_end", /*optional=*/true, "height of the last block which enforces the rules (only for temporary deployments)"},
+    {RPCResult::Type::NUM, "coinbase_expiry_time", /*optional=*/true, "mining-block parent MTP cutoff for newly covered rewards; previously covered rewards retain long maturity after this time"},
+    {RPCResult::Type::NUM, "coinbase_start_height", /*optional=*/true, "height of the first generated coin covered by the long coinbase maturity rule (only for \"long_coinbase_maturity\")"},
+    {RPCResult::Type::NUM, "maturity", /*optional=*/true, "required coinbase maturity depth for covered generated coins (only for \"long_coinbase_maturity\")"},
+    {RPCResult::Type::BOOL, "active", "true if the consensus rules are enforced for the next block (policy may enforce related rules independently of this flag)"},
+    {RPCResult::Type::NUM_TIME, "expiry_time", /*optional=*/true, "median time past at and after which the rules are no longer enforced (only for \"flagday\" type; a block is past expiry when its parent's median time past has reached this value)"},
     {RPCResult::Type::OBJ, "bip9", /*optional=*/true, "status of bip9 softforks (only for \"bip9\" type)",
     {
         {RPCResult::Type::NUM, "bit", /*optional=*/true, "the bit (0-28) in the block version field used to signal this softfork (only for \"started\" and \"locked_in\" status)"},
@@ -1888,6 +1953,47 @@ const std::vector<RPCResult> RPCHelpForDeployment{
     }},
 };
 
+// RDTS (a flag-day deployment, not a versionbits one): rules apply to every
+// block from the BLAKE2b hardfork height until the parent block's
+// median-time-past reaches RdtsExpiryTime. Reported as-of the queried block,
+// with "active" meaning the next block, like the versionbits entries. Omitted
+// entirely when unscheduled (plain regtest), as NEVER_ACTIVE deployments are.
+void RdtsFlagDayDescPushBack(const CBlockIndex* blockindex, UniValue& softforks, const ChainstateManager& chainman)
+{
+    const Consensus::Params& params{chainman.GetConsensus()};
+    if (params.Blake2bHeight == std::numeric_limits<int>::max() ||
+        params.RdtsExpiryTime == std::numeric_limits<int64_t>::min()) return;
+
+    UniValue rv(UniValue::VOBJ);
+    rv.pushKV("type", "flagday");
+    rv.pushKV("height", params.RdtsActivationHeight());
+    rv.pushKV("expiry_time", params.RdtsExpiryTime);
+    // "active" describes the NEXT block, as the versionbits entries do, so the
+    // queried block is that block's parent and its median-time-past is exactly
+    // the parent median-time-past RdtsActiveAt expects.
+    rv.pushKV("active", params.RdtsActiveAt(blockindex->nHeight + 1, blockindex->GetMedianTimePast()));
+    softforks.pushKV("reduced_data", std::move(rv));
+}
+
+void LongCoinbaseMaturityDescPushBack(const CBlockIndex* blockindex, UniValue& softforks, const ChainstateManager& chainman)
+{
+    const Consensus::Params& params{chainman.GetConsensus()};
+    if (params.CoinbaseMaturityLongEnforceHeight == std::numeric_limits<int>::max()) return;
+
+    UniValue rv(UniValue::VOBJ);
+    rv.pushKV("type", "flagday");
+    rv.pushKV("height", params.CoinbaseMaturityLongEnforceHeight);
+    if (params.CoinbaseMaturityLongUntilRdts) {
+        rv.pushKV("coinbase_expiry_time", params.RdtsExpiryTime);
+    } else {
+        rv.pushKV("height_end", params.CoinbaseMaturityLongReleaseHeight - 1);
+    }
+    rv.pushKV("coinbase_start_height", params.CoinbaseMaturityLongStartHeight);
+    rv.pushKV("maturity", params.CoinbaseMaturityLong);
+    rv.pushKV("active", params.CoinbaseMaturityLongActiveAt(blockindex->nHeight + 1));
+    softforks.pushKV("long_coinbase_maturity", std::move(rv));
+}
+
 UniValue DeploymentInfo(const CBlockIndex* blockindex, const ChainstateManager& chainman)
 {
     UniValue softforks(UniValue::VOBJ);
@@ -1898,7 +2004,8 @@ UniValue DeploymentInfo(const CBlockIndex* blockindex, const ChainstateManager& 
     SoftForkDescPushBack(blockindex, softforks, chainman, Consensus::DEPLOYMENT_SEGWIT);
     SoftForkDescPushBack(blockindex, softforks, chainman, Consensus::DEPLOYMENT_TESTDUMMY);
     SoftForkDescPushBack(blockindex, softforks, chainman, Consensus::DEPLOYMENT_TAPROOT);
-    SoftForkDescPushBack(blockindex, softforks, chainman, Consensus::DEPLOYMENT_REDUCED_DATA);
+    RdtsFlagDayDescPushBack(blockindex, softforks, chainman);
+    LongCoinbaseMaturityDescPushBack(blockindex, softforks, chainman);
     return softforks;
 }
 } // anon namespace
@@ -1916,6 +2023,10 @@ RPCHelpMan getdeploymentinfo()
                 {RPCResult::Type::NUM, "height", "requested block height (or tip)"},
                 {RPCResult::Type::OBJ_DYN, "deployments", "", {
                     {RPCResult::Type::OBJ, "xxxx", "name of the deployment", RPCHelpForDeployment}
+                }},
+                {RPCResult::Type::OBJ, "blake2b", /*optional=*/true, "hardfork schedule, present only when one is configured", {
+                    {RPCResult::Type::NUM, "height", "the height the hardfork activates at"},
+                    {RPCResult::Type::BOOL, "active", "whether the hardfork rules apply to the block after this one"},
                 }},
             }
         },
@@ -1941,6 +2052,23 @@ RPCHelpMan getdeploymentinfo()
             deploymentinfo.pushKV("hash", blockindex->GetBlockHash().ToString());
             deploymentinfo.pushKV("height", blockindex->nHeight);
             deploymentinfo.pushKV("deployments", DeploymentInfo(blockindex, chainman));
+
+            // Reported at the top level rather than among the deployments so
+            // an operator can see whether the fork is scheduled and whether it
+            // has taken effect, instead of inferring that from rejected
+            // transactions. Every rule the fork carries activates together, at
+            // the deployment the proof-of-work change uses.
+            const Consensus::Params& consensus{chainman.GetConsensus()};
+            if (consensus.Blake2bHeight != std::numeric_limits<int>::max()) {
+                UniValue hf(UniValue::VOBJ);
+                hf.pushKV("height", consensus.Blake2bHeight);
+                // The block after this one is built on it, so ask whether the
+                // deployment is active after it. Delegated rather than
+                // open-coded so this cannot drift from consensus.
+                hf.pushKV("active", DeploymentActiveAfter(blockindex, chainman,
+                                                          Consensus::DEPLOYMENT_BLAKE2B));
+                deploymentinfo.pushKV("blake2b", std::move(hf));
+            }
             return deploymentinfo;
         },
     };
@@ -3433,39 +3561,29 @@ static RPCHelpMan getblockfilter()
 }
 
 /**
- * RAII class that disables the network in its constructor and enables it in its
- * destructor.
+ * RAII class that registers a prune lock in its constructor to prevent
+ * block data from being pruned, and removes it in its destructor.
  */
-class NetworkDisable
+class TemporaryPruneLock
 {
-    CConnman& m_connman;
+    static constexpr const char* LOCK_NAME{"dumptxoutset-rollback"};
+    BlockManager& m_blockman;
 public:
-    NetworkDisable(CConnman& connman) : m_connman(connman) {
-        m_connman.SetNetworkActive(false);
-        if (m_connman.GetNetworkActive()) {
-            throw JSONRPCError(RPC_MISC_ERROR, "Network activity could not be suspended.");
-        }
-    };
-    ~NetworkDisable() {
-        m_connman.SetNetworkActive(true);
-    };
-};
-
-/**
- * RAII class that temporarily rolls back the local chain in it's constructor
- * and rolls it forward again in it's destructor.
- */
-class TemporaryRollback
-{
-    ChainstateManager& m_chainman;
-    const CBlockIndex& m_invalidate_index;
-public:
-    TemporaryRollback(ChainstateManager& chainman, const CBlockIndex& index) : m_chainman(chainman), m_invalidate_index(index) {
-        InvalidateBlock(m_chainman, m_invalidate_index.GetBlockHash());
-    };
-    ~TemporaryRollback() {
-        ReconsiderBlock(m_chainman, m_invalidate_index.GetBlockHash());
-    };
+    TemporaryPruneLock(BlockManager& blockman, int height) : m_blockman(blockman)
+    {
+        LOCK(::cs_main);
+        node::PruneLockInfo lock_info;
+        lock_info.desc = "dumptxoutset rollback";
+        lock_info.height_first = height;
+        m_blockman.UpdatePruneLock(LOCK_NAME, lock_info);
+        LogDebug(BCLog::PRUNE, "dumptxoutset: registered prune lock at height %d", height);
+    }
+    ~TemporaryPruneLock()
+    {
+        LOCK(::cs_main);
+        m_blockman.DeletePruneLock(LOCK_NAME);
+        LogDebug(BCLog::PRUNE, "dumptxoutset: released prune lock");
+    }
 };
 
 /**
@@ -3491,10 +3609,9 @@ static RPCHelpMan dumptxoutset()
 
     return RPCHelpMan{
         "dumptxoutset",
-        "Write the UTXO set to a file. This can be used in loadtxoutset afterwards if this snapshot height is supported in the chainparams as well.\n\n"
-        "Unless the \"latest\" type is requested, the node will roll back to the requested height and network activity will be suspended during this process. "
-        "Because of this it is discouraged to interact with the node in any other way during the execution of this call to avoid inconsistent results and race conditions, particularly RPCs that interact with blockstorage.\n\n"
-        "This call may take several minutes. Make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)",
+        "Write the serialized UTXO set to a file. This can be used in loadtxoutset afterwards if this snapshot height is supported in the chainparams as well.\n"
+        "This creates a temporary UTXO database when rolling back, keeping the main chain intact. Should the node experience an unclean shutdown the temporary database may need to be removed from the datadir manually.\n"
+        "For deep rollbacks, make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0) as it may take several minutes.",
         {
             {"path", RPCArg::Type::STR, RPCArg::Optional::NO, "Path to the output file. If relative, will be prefixed by datadir."},
             {"type|format", {RPCArg::Type::STR, RPCArg::Type::ARR}, RPCArg::Default(""), "The type of snapshot to create. Can be \"latest\" to create a snapshot of the current UTXO set or \"rollback\" to temporarily roll back the state of the node to a historical block before creating the snapshot of a historical UTXO set. This parameter can be omitted if a separate \"rollback\" named parameter is specified indicating the height or hash of a specific historical block. If \"rollback\" is specified and separate \"rollback\" named parameter is not specified, this will roll back to the latest valid snapshot block that can currently be loaded with loadtxoutset."},
@@ -3508,6 +3625,7 @@ static RPCHelpMan dumptxoutset()
                     {"rollback", RPCArg::Type::NUM, RPCArg::Optional::OMITTED,
                         "Height or hash of the block to roll back to before creating the snapshot. Note: The further this number is from the tip, the longer this process will take. Consider setting a higher -rpcclienttimeout value in this case.",
                     RPCArgOptions{.skip_type_check = true, .type_str = {"", "string or numeric"}}},
+                    {"in_memory", RPCArg::Type::BOOL, RPCArg::Default{false}, "If true, the temporary UTXO-set database used during rollback is kept entirely in memory. This can significantly speed up the process but requires sufficient free RAM (over 10 GB on mainnet)."},
                     {"show_header", RPCArg::Type::BOOL, RPCArg::Default{true}, "Whether to include the header line in non-serialized (ASCII) mode", RPCArgOptions{.also_positional = true}},
                     {"separator", RPCArg::Type::STR, RPCArg::Default{","}, "Field separator to use in non-serialized (ASCII) mode", RPCArgOptions{.also_positional = true}},
                 },
@@ -3528,7 +3646,8 @@ static RPCHelpMan dumptxoutset()
         RPCExamples{
             HelpExampleCli("-rpcclienttimeout=0 dumptxoutset", "utxo.dat latest") +
             HelpExampleCli("-rpcclienttimeout=0 dumptxoutset", "utxo.dat rollback") +
-            HelpExampleCli("-rpcclienttimeout=0 -named dumptxoutset", R"(utxo.dat rollback=853456)")
+            HelpExampleCli("-rpcclienttimeout=0 -named dumptxoutset", R"(utxo.dat rollback=853456)") +
+            HelpExampleCli("-rpcclienttimeout=0 -named dumptxoutset", R"(utxo.dat rollback=853456 in_memory=true)")
             +
             HelpExampleCli("-rpcclienttimeout=0 -named dumptxoutset", "utxo.dat type=latest format='[]'") +
             HelpExampleCli("-rpcclienttimeout=0 -named dumptxoutset", "utxo.dat type=latest format='[\"txid\", \"vout\"]' show_header=false separator=':'")
@@ -3546,7 +3665,7 @@ static RPCHelpMan dumptxoutset()
     const UniValue& hr_format = [&]() -> const UniValue& {
         if (options["format"].isNull() && request.params[1].isArray()) {
             // Knots 0.20.0-28.1 compatibility
-            snapshot_type = "latest";
+            if (!options.exists("rollback")) snapshot_type = "latest";
             return request.params[1];
         }
         snapshot_type = self.Arg<std::string>("type");
@@ -3635,16 +3754,37 @@ static RPCHelpMan dumptxoutset()
             "Couldn't open file " + temppath.utf8string() + " for writing.");
     }
 
-    CConnman& connman = EnsureConnman(node);
-    const CBlockIndex* invalidate_index{nullptr};
-    std::optional<NetworkDisable> disable_network;
-    std::optional<TemporaryRollback> temporary_rollback;
-
-    // If the user wants to dump the txoutset of the current tip, we don't have
-    // to roll back at all
-    if (target_index != tip) {
-        // If the node is running in pruned mode we ensure all necessary block
-        // data is available before starting to roll back.
+    UniValue result;
+    Chainstate& chainstate{node.chainman->ActiveChainstate()};
+    if (target_index == tip) {
+        // Dump the txoutset of the current tip
+        std::unique_ptr<CCoinsViewCursor> cursor;
+        CCoinsStats stats;
+        {
+            // Lock the chainstate before calling PrepareUtxoSnapshot, to be able
+            // to get a UTXO database cursor while the chain is pointing at the
+            // target block. After that, release the lock while calling
+            // WriteUTXOSnapshot. The cursor will remain valid and be used by
+            // WriteUTXOSnapshot to write a consistent snapshot even if the
+            // chainstate changes.
+            LOCK(node.chainman->GetMutex());
+            std::tie(cursor, stats, tip) = PrepareUTXOSnapshot(chainstate, node.rpc_interruption_point);
+        }
+        result = WriteUTXOSnapshot(
+                                   is_human_readable,
+                                   show_header, separator, requested,
+                                   chainstate,
+                                   cursor.get(),
+                                   &stats,
+                                   tip,
+                                   std::move(afile),
+                                   path,
+                                   temppath,
+                                   node.rpc_interruption_point);
+    } else {
+        // Check pruning constraints before attempting rollback and prevent
+        // pruning of the necessary blocks with a temporary prune lock
+        std::optional<TemporaryPruneLock> temp_prune_lock;
         if (node.chainman->m_blockman.IsPruneMode()) {
             LOCK(node.chainman->GetMutex());
             const CBlockIndex* current_tip{node.chainman->ActiveChain().Tip()};
@@ -3652,68 +3792,196 @@ static RPCHelpMan dumptxoutset()
             if (first_block->nHeight > target_index->nHeight) {
                 throw JSONRPCError(RPC_MISC_ERROR, "Could not roll back to requested height since necessary block data is already pruned.");
             }
+            temp_prune_lock.emplace(node.chainman->m_blockman, target_index->nHeight);
         }
 
-        // Suspend network activity for the duration of the process when we are
-        // rolling back the chain to get a utxo set from a past height. We do
-        // this so we don't punish peers that send us that send us data that
-        // seems wrong in this temporary state. For example a normal new block
-        // would be classified as a block connecting an invalid block.
-        // Skip if the network is already disabled because this
-        // automatically re-enables the network activity at the end of the
-        // process which may not be what the user wants.
-        if (connman.GetNetworkActive()) {
-            disable_network.emplace(connman);
-        }
-
-        invalidate_index = WITH_LOCK(::cs_main, return node.chainman->ActiveChain().Next(target_index));
-        temporary_rollback.emplace(*node.chainman, *invalidate_index);
+        const bool in_memory{options.exists("in_memory") ? options["in_memory"].get_bool() : false};
+        result = CreateRolledBackUTXOSnapshot(node,
+                                              chainstate,
+                                              target_index,
+                                              is_human_readable,
+                                              show_header, separator, requested,
+                                              std::move(afile),
+                                              path,
+                                              temppath,
+                                              in_memory);
     }
 
-    Chainstate* chainstate;
-    std::unique_ptr<CCoinsViewCursor> cursor;
-    CCoinsStats stats;
-    {
-        // Lock the chainstate before calling PrepareUtxoSnapshot, to be able
-        // to get a UTXO database cursor while the chain is pointing at the
-        // target block. After that, release the lock while calling
-        // WriteUTXOSnapshot. The cursor will remain valid and be used by
-        // WriteUTXOSnapshot to write a consistent snapshot even if the
-        // chainstate changes.
-        LOCK(node.chainman->GetMutex());
-        chainstate = &node.chainman->ActiveChainstate();
-        // In case there is any issue with a block being read from disk we need
-        // to stop here, otherwise the dump could still be created for the wrong
-        // height.
-        // The new tip could also not be the target block if we have a stale
-        // sister block of invalidate_index. This block (or a descendant) would
-        // be activated as the new tip and we would not get to new_tip_index.
-        if (target_index != chainstate->m_chain.Tip()) {
-            LogWarning("dumptxoutset failed to roll back to requested height, reverting to tip.\n");
-            throw JSONRPCError(RPC_MISC_ERROR, "Could not roll back to requested height.");
-        } else {
-            std::tie(cursor, stats, tip) = PrepareUTXOSnapshot(*chainstate, node.rpc_interruption_point);
-        }
+    if (!fs::is_fifo(path_info)) {
+        fs::rename(temppath, path);
     }
-
-    UniValue result = WriteUTXOSnapshot(
-                                        is_human_readable,
-                                        show_header, separator, requested,
-                                        *chainstate,
-                                        cursor.get(),
-                                        &stats,
-                                        tip,
-                                        std::move(afile),
-                                        path,
-                                        temppath,
-                                        node.rpc_interruption_point);
-    if (!fs::is_fifo(path_info)) fs::rename(temppath, path);
 
     result.pushKV("path", path.utf8string());
     return result;
 },
     };
 }
+
+/**
+ * RAII class that creates a temporary database directory in its constructor
+ * and removes it in its destructor.
+ */
+class TemporaryUTXODatabase
+{
+    fs::path m_path;
+public:
+    TemporaryUTXODatabase(const fs::path& path) : m_path(path) {
+        fs::create_directories(m_path);
+    }
+    ~TemporaryUTXODatabase() {
+        if (!DestroyDB(fs::PathToString(m_path))) {
+            LogInfo("Failed to clean up temporary UTXO database at %s, please remove it manually.",
+                    fs::PathToString(m_path));
+        }
+    }
+};
+
+UniValue CreateRolledBackUTXOSnapshot(
+    NodeContext& node,
+    Chainstate& chainstate,
+    const CBlockIndex* target,
+    const bool is_human_readable,
+    const bool show_header,
+    const Span<const std::byte>& separator,
+    const std::vector<std::pair<std::string, coinascii_cb_t>>& requested,
+    AutoFile&& afile,
+    const fs::path& path,
+    const fs::path& tmppath,
+    const bool in_memory)
+{
+    // Create a temporary leveldb to store the UTXO set that is being rolled back
+    std::string temp_db_name{strprintf("temp_utxo_%d", target->nHeight)};
+    fs::path temp_db_path{fsbridge::AbsPathJoin(tmppath.parent_path(), fs::u8path(temp_db_name))};
+
+    // Only create the on-disk temp directory when not using in-memory mode
+    std::optional<TemporaryUTXODatabase> temp_db_cleaner;
+    if (!in_memory) {
+        temp_db_cleaner.emplace(temp_db_path);
+    } else {
+        LogInfo("Using in-memory database for UTXO-set rollback (this may require significant RAM).");
+    }
+
+    // Create temporary database
+    DBParams db_params{
+        .path = temp_db_path,
+        .cache_bytes = 0,
+        .memory_only = in_memory,
+        .wipe_data = true,
+        .obfuscate = false,
+        .options = DBOptions{}
+    };
+
+    std::unique_ptr<CCoinsViewDB> temp_db = std::make_unique<CCoinsViewDB>(
+        std::move(db_params),
+        CoinsViewOptions{}
+    );
+
+    const CBlockIndex* tip = nullptr;
+    LogInfo("Copying current UTXO set to temporary database.");
+    {
+        CCoinsViewCache temp_cache(temp_db.get());
+        std::unique_ptr<CCoinsViewCursor> cursor;
+        {
+            LOCK(::cs_main);
+            tip = chainstate.m_chain.Tip();
+            chainstate.ForceFlushStateToDisk();
+            cursor = chainstate.CoinsDB().Cursor();
+        }
+        temp_cache.SetBestBlock(tip->GetBlockHash());
+
+        size_t coins_count = 0;
+        while (cursor->Valid()) {
+            node.rpc_interruption_point();
+
+            COutPoint key;
+            Coin coin;
+            if (cursor->GetKey(key) && cursor->GetValue(coin)) {
+                temp_cache.AddCoin(key, std::move(coin), false);
+                coins_count++;
+
+                // Log every 10M coins (optimized for mainnet)
+                if (coins_count % 10'000'000 == 0) {
+                    LogInfo("Copying UTXO set: %uM coins copied.", coins_count / 1'000'000);
+                }
+
+                // Flush periodically
+                if (coins_count % 100'000 == 0) {
+                    temp_cache.Flush();
+                }
+            }
+            cursor->Next();
+        }
+
+        temp_cache.Flush();
+        LogInfo("UTXO set copy complete: %u coins total", coins_count);
+    }
+
+    LogInfo("Rolling back from height %d to %d", tip->nHeight, target->nHeight);
+
+    const CBlockIndex* block_index{tip};
+    const size_t total_blocks{static_cast<size_t>(block_index->nHeight - target->nHeight)};
+    CCoinsViewCache rollback_cache(temp_db.get());
+    rollback_cache.SetBestBlock(block_index->GetBlockHash());
+    size_t blocks_processed = 0;
+    int last_progress{0};
+    DisconnectResult res;
+
+    while (block_index->nHeight > target->nHeight) {
+        node.rpc_interruption_point();
+
+        CBlock block;
+        if (!node.chainman->m_blockman.ReadBlock(block, *block_index)) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                strprintf("Failed to read block at height %d", block_index->nHeight));
+        }
+
+        WITH_LOCK(::cs_main, res = chainstate.DisconnectBlock(block, block_index, rollback_cache));
+        if (res == DISCONNECT_FAILED) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                strprintf("Failed to roll back block at height %d", block_index->nHeight));
+        }
+
+        blocks_processed++;
+        int progress{static_cast<int>(blocks_processed * 100 / total_blocks)};
+        if (progress >= last_progress + 5) {
+            LogInfo("Rolled back %d%% of blocks.", progress);
+            last_progress = progress;
+            rollback_cache.Flush();
+        }
+
+        block_index = block_index->pprev;
+    }
+
+    CHECK_NONFATAL(rollback_cache.GetBestBlock() == target->GetBlockHash());
+    rollback_cache.Flush();
+
+    LogInfo("Rollback complete. Computing UTXO statistics for created txoutset dump.");
+    std::optional<CCoinsStats> maybe_stats = GetUTXOStats(temp_db.get(),
+                                                          chainstate.m_blockman,
+                                                          CoinStatsHashType::HASH_SERIALIZED,
+                                                          node.rpc_interruption_point);
+
+    if (!maybe_stats) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to compute UTXO statistics");
+    }
+
+    std::unique_ptr<CCoinsViewCursor> pcursor{temp_db->Cursor()};
+    if (!pcursor) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to create UTXO cursor");
+    }
+
+    LogInfo("Writing snapshot to disk.");
+    return WriteUTXOSnapshot(is_human_readable, show_header, separator, requested,
+                             chainstate,
+                             pcursor.get(),
+                             &(*maybe_stats),
+                             target,
+                             std::move(afile),
+                             path,
+                             tmppath,
+                             node.rpc_interruption_point);
+}
+
 
 std::tuple<std::unique_ptr<CCoinsViewCursor>, CCoinsStats, const CBlockIndex*>
 PrepareUTXOSnapshot(
@@ -3968,7 +4236,8 @@ const std::vector<RPCResult> RPCHelpForChainstate{
     {RPCResult::Type::STR_HEX, "bestblockhash", "blockhash of the tip"},
     {RPCResult::Type::STR_HEX, "bits", "nBits: compact representation of the block difficulty target"},
     {RPCResult::Type::STR_HEX, "target", "The difficulty target"},
-    {RPCResult::Type::NUM, "difficulty", "difficulty of the tip"},
+    {RPCResult::Type::NUM, "difficulty", /*optional=*/true, "The proof-of-work difficulty as a multiple of the minimum difficulty (only for SHA256d blocks)"},
+    {RPCResult::Type::NUM, "difficulty_blake2b", /*optional=*/true, "The expected average number of BLAKE2b hashes needed to find the chainstate's tip block (only for header-v2 blocks)"},
     {RPCResult::Type::NUM, "verificationprogress", "progress towards the network tip"},
     {RPCResult::Type::STR_HEX, "snapshot_blockhash", /*optional=*/true, "the base block of the snapshot this chainstate is based on, if any"},
     {RPCResult::Type::NUM, "coins_db_cache_bytes", "size of the coinsdb cache"},
@@ -4012,7 +4281,7 @@ return RPCHelpMan{
         data.pushKV("bestblockhash",         tip->GetBlockHash().GetHex());
         data.pushKV("bits", strprintf("%08x", tip->nBits));
         data.pushKV("target", GetTarget(*tip, chainman.GetConsensus().powLimit).GetHex());
-        data.pushKV("difficulty", GetDifficulty(*tip));
+        PushDifficulty(data, *tip);
         data.pushKV("verificationprogress", chainman.GuessVerificationProgress(tip));
         data.pushKV("coins_db_cache_bytes",  cs.m_coinsdb_cache_size_bytes);
         data.pushKV("coins_tip_cache_bytes", cs.m_coinstip_cache_size_bytes);
@@ -4161,7 +4430,6 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getblockhash},
         {"blockchain", &getblockheader},
         {"blockchain", &getchaintips},
-        {"blockchain", &getdifficulty},
         {"blockchain", &getdeploymentinfo},
         {"blockchain", &gettxout},
         {"blockchain", &gettxoutsetinfo},

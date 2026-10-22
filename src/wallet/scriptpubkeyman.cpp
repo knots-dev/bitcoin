@@ -19,12 +19,45 @@
 #include <util/translation.h>
 #include <wallet/scriptpubkeyman.h>
 
+#include <limits>
 #include <optional>
 
 using common::PSBTError;
 using util::ToString;
 
 namespace wallet {
+namespace {
+/** Whether a PSBT's declared hash type and the one this wallet will sign with
+ *  mean the same signature.
+ *
+ *  `unified` is what the wallet is about to produce, which does not come from
+ *  the request, so the declared type may legitimately carry the opt-in bit when
+ *  the request does not. Reconcile only in that direction: if
+ *  the wallet is not opting in, a PSBT that demands the opt-in is a genuine
+ *  disagreement and must still fail, or the wallet signs the legacy message
+ *  while the PSBT continues to advertise the unified one.
+ *
+ *  The bit cannot ride on SIGHASH_DEFAULT, which appends no byte to hold it, so
+ *  an opted-in taproot signature names SIGHASH_ALL instead and the two mean the
+ *  same thing here. Without the opt-in in play the comparison is unchanged, so
+ *  ALL against NONE still fails, and so does DEFAULT against ALL. */
+bool SighashTypesAgree(int declared, int requested)
+{
+    if (SighashRulesForSigning() != SighashRules::UNIFIED) return declared == requested;
+    if ((declared & SIGHASH_UNIFIED) == 0 && (requested & SIGHASH_UNIFIED) == 0) {
+        return declared == requested;
+    }
+    // Only a hash type that really is SIGHASH_DEFAULT means ALL. Stripping the
+    // opt-in bit off 0x20 leaves zero as well, and that is a different type
+    // with a message of its own, so it must not be folded into ALL here.
+    const auto canonical = [](int type) {
+        if (type == SIGHASH_DEFAULT) return int{SIGHASH_ALL};
+        return type & ~SIGHASH_UNIFIED;
+    };
+    return canonical(declared) == canonical(requested);
+}
+} // namespace
+
 //! Value for the first BIP 32 hardened derivation. Can be used as a bit mask and as a value. See BIP 32 for more details.
 const uint32_t BIP32_HARDENED_KEY_LIMIT = 0x80000000;
 
@@ -233,9 +266,16 @@ SigningResult ScriptPubKeyMan::SignMessageBIP322(MessageSignatureFormat format, 
     std::map<COutPoint, Coin> coins;
     coins[to_sign.vin[0].prevout] = Coin(to_spend.vout[0], 1, false);
 
-    // Sign the transaction
+    // Sign the transaction.
+    //
+    // Deliberately does not opt in to the hardfork signature hash, and must not
+    // be changed to. This is a BIP322 message signature, not a spend: it is
+    // verified against a hash type of exactly SIGHASH_ALL, so opting in would
+    // produce a signature this node's own verifier rejects, and would not be
+    // recognized by other implementations either.
     std::map<int, bilingual_str> errors;
-    if (!::SignTransaction(to_sign, keystore, coins, SIGHASH_ALL, errors)) {
+    if (!::SignTransaction(to_sign, keystore, coins, SIGHASH_ALL, errors,
+                           /*inputs_amount_sum=*/nullptr, /*sighash_rules=*/SighashRules::LEGACY)) {
         // TODO: this may be a multisig which successfully signed but needed additional signatures
         return SigningResult::SIGNING_FAILED;
     }
@@ -706,7 +746,7 @@ SigningResult LegacyScriptPubKeyMan::SignMessage(const MessageSignatureFormat fo
     return SigningResult::SIGNING_FAILED;
 }
 
-std::optional<PSBTError> LegacyScriptPubKeyMan::FillPSBT(PartiallySignedTransaction& psbtx, const PrecomputedTransactionData& txdata, int sighash_type, bool sign, bool bip32derivs, int* n_signed, bool finalize) const
+std::optional<PSBTError> LegacyScriptPubKeyMan::FillPSBT(PartiallySignedTransaction& psbtx, const PrecomputedTransactionData& txdata, int sighash_type, bool sign, bool bip32derivs, int* n_signed, bool finalize, std::vector<bilingual_str>* warnings) const
 {
     if (n_signed) {
         *n_signed = 0;
@@ -720,7 +760,8 @@ std::optional<PSBTError> LegacyScriptPubKeyMan::FillPSBT(PartiallySignedTransact
         }
 
         // Get the Sighash type
-        if (sign && input.sighash_type != std::nullopt && *input.sighash_type != sighash_type) {
+        if (sign && input.sighash_type != std::nullopt &&
+            !SighashTypesAgree(*input.sighash_type, sighash_type)) {
             return PSBTError::SIGHASH_MISMATCH;
         }
 
@@ -1960,10 +2001,13 @@ std::optional<MigrationData> LegacyDataSPKM::MigrateToDescriptor()
     for (const auto& chain_pair : m_inactive_hd_chains) {
         chains.push_back(chain_pair.second);
     }
+
+    bool can_support_hd_split_feature = m_hd_chain.nVersion >= CHDChain::VERSION_HD_CHAIN_SPLIT;
+
     for (const CHDChain& chain : chains) {
         for (int i = 0; i < 2; ++i) {
             // Skip if doing internal chain and split chain is not supported
-            if (chain.seed_id.IsNull() || (i == 1 && !m_storage.CanSupportFeature(FEATURE_HD_SPLIT))) {
+            if (chain.seed_id.IsNull() || (i == 1 && !can_support_hd_split_feature)) {
                 continue;
             }
             // Get the master xprv
@@ -2352,8 +2396,14 @@ bool DescriptorScriptPubKeyMan::TopUpWithDB(WalletBatch& batch, unsigned int siz
         target_size = m_keypool_size;
     }
 
-    // Calculate the new range_end
-    int32_t new_range_end = std::max(m_wallet_descriptor.next_index + (int32_t)target_size, m_wallet_descriptor.range_end);
+    // Calculate the new range_end. next_index can be as high as 2^31-1 on an imported
+    // descriptor and target_size is user controlled, so compute the end in a wider type.
+    // The range is left unchanged if that end does not fit in the int32_t it is stored in.
+    const int64_t target_end{int64_t{m_wallet_descriptor.next_index} + target_size};
+    int32_t new_range_end = m_wallet_descriptor.range_end;
+    if (target_end <= std::numeric_limits<int32_t>::max()) {
+        new_range_end = std::max(static_cast<int32_t>(target_end), m_wallet_descriptor.range_end);
+    }
 
     // If the descriptor is not ranged, we actually just want to fill the first cache item
     if (!m_wallet_descriptor.descriptor->IsRange()) {
@@ -2662,7 +2712,7 @@ SigningResult DescriptorScriptPubKeyMan::SignMessage(const MessageSignatureForma
     return SigningResult::OK;
 }
 
-std::optional<PSBTError> DescriptorScriptPubKeyMan::FillPSBT(PartiallySignedTransaction& psbtx, const PrecomputedTransactionData& txdata, int sighash_type, bool sign, bool bip32derivs, int* n_signed, bool finalize) const
+std::optional<PSBTError> DescriptorScriptPubKeyMan::FillPSBT(PartiallySignedTransaction& psbtx, const PrecomputedTransactionData& txdata, int sighash_type, bool sign, bool bip32derivs, int* n_signed, bool finalize, std::vector<bilingual_str>* warnings) const
 {
     if (n_signed) {
         *n_signed = 0;
@@ -2676,7 +2726,8 @@ std::optional<PSBTError> DescriptorScriptPubKeyMan::FillPSBT(PartiallySignedTran
         }
 
         // Get the Sighash type
-        if (sign && input.sighash_type != std::nullopt && *input.sighash_type != sighash_type) {
+        if (sign && input.sighash_type != std::nullopt &&
+            !SighashTypesAgree(*input.sighash_type, sighash_type)) {
             return PSBTError::SIGHASH_MISMATCH;
         }
 

@@ -94,7 +94,7 @@ class TestBitcoinCli(BitcoinTestFramework):
         self.log.info("Test -netinfo local services are moved to header if details are requested")
         det = self.nodes[0].cli('-netinfo', '1').send_cli().splitlines()
         self.log.debug(f"Test -netinfo 1 header output: {det[0]}")
-        assert re.match(rf"^{re.escape(self.config['environment']['CLIENT_NAME'])} client.+services nwl2?4$", det[0])
+        assert re.match(rf"^{re.escape(self.config['environment']['CLIENT_NAME'])} client.+services nwl2?B$", det[0])
         assert not any(line.startswith("Local services:") for line in det)
 
     def run_test(self):
@@ -225,7 +225,12 @@ class TestBitcoinCli(BitcoinTestFramework):
         expected_network_info = f"in {network_info['connections_in']}, out {network_info['connections_out']}, total {network_info['connections']}"
         assert_equal(cli_get_info["Network"], expected_network_info)
         assert_equal(cli_get_info['Proxies'], network_info['networks'][0]['proxy'])
-        assert_equal(Decimal(cli_get_info['Difficulty']), blockchain_info['difficulty'])
+        if 'difficulty' in blockchain_info:
+            assert_equal(Decimal(cli_get_info['Difficulty']), blockchain_info['difficulty'])
+            assert 'Difficulty (BLAKE2b hashes)' not in cli_get_info
+        else:
+            assert_equal(Decimal(cli_get_info['Difficulty (BLAKE2b hashes)']), blockchain_info['difficulty_blake2b'])
+            assert 'Difficulty' not in cli_get_info
         assert_equal(cli_get_info['Chain'], blockchain_info['chain'])
         for field in ['Blocks', 'Headers', 'Time offset (s)', 'Version']:
             assert_scale(int(cli_get_info[field]), expected_scale=0)
