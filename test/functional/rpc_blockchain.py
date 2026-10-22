@@ -11,7 +11,6 @@ Test the following RPCs:
     - gettxoutsetinfo
     - gettxout
     - getblockheader
-    - getdifficulty
     - getnetworkhashps
     - waitforblockheight
     - getblock
@@ -40,6 +39,7 @@ from test_framework.blocktools import (
     target_str,
 )
 from test_framework.messages import (
+    CBlock,
     CBlockHeader,
     COIN,
     from_hex,
@@ -93,7 +93,6 @@ class BlockchainTest(BitcoinTestFramework):
         self._test_gettxoutsetinfo()
         self._test_gettxout()
         self._test_getblockheader()
-        self._test_getdifficulty()
         self._test_getnetworkhashps()
         self._test_stopatheight()
         self._test_waitforblock() # also tests waitfornewblock
@@ -204,6 +203,8 @@ class BlockchainTest(BitcoinTestFramework):
 
         assert_equal(res['bits'], nbits_str(REGTEST_N_BITS))
         assert_equal(res['target'], target_str(REGTEST_TARGET))
+        assert_equal(res['difficulty'], Decimal('4.656542373906925E-10'))
+        assert 'difficulty_blake2b' not in res
 
     def check_signalling_deploymentinfo_result(self, gdi_result, height, blockhash, status_next):
         assert height >= 144 and height <= 287
@@ -458,7 +459,8 @@ class BlockchainTest(BitcoinTestFramework):
         assert isinstance(header['nonce'], int)
         assert isinstance(header['version'], int)
         assert isinstance(int(header['versionHex'], 16), int)
-        assert isinstance(header['difficulty'], Decimal)
+        assert_equal(header['difficulty'], Decimal('4.656542373906925E-10'))
+        assert 'difficulty_blake2b' not in header
 
         # Test with verbose=False, which should return the header as hex.
         header_hex = node.getblockheader(blockhash=besthash, verbose=False)
@@ -470,13 +472,6 @@ class BlockchainTest(BitcoinTestFramework):
 
         assert 'previousblockhash' not in node.getblockheader(node.getblockhash(0))
         assert 'nextblockhash' not in node.getblockheader(node.getbestblockhash())
-
-    def _test_getdifficulty(self):
-        self.log.info("Test getdifficulty")
-        difficulty = self.nodes[0].getdifficulty()
-        # 1 hash in 2 should be valid, so difficulty should be 1/2**31
-        # binary => decimal => binary math is why we do this check
-        assert abs(difficulty * 2**31 - 1) < 0.0001
 
     def _test_getnetworkhashps(self):
         self.log.info("Test getnetworkhashps")
@@ -632,8 +627,9 @@ class BlockchainTest(BitcoinTestFramework):
         blockhash = self.generate(node, 1)[0]
 
         def assert_hexblock_hashes(verbosity):
-            block = node.getblock(blockhash, verbosity)
-            assert_equal(blockhash, hash256(bytes.fromhex(block[:160]))[::-1].hex())
+            block = from_hex(CBlock(), node.getblock(blockhash, verbosity))
+            block.rehash()
+            assert_equal(blockhash, block.hash)
 
         def assert_fee_not_in_block(hash, verbosity):
             block = node.getblock(hash, verbosity)

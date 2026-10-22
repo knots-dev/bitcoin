@@ -29,6 +29,7 @@
 #include <random.h>
 #include <scheduler.h>
 #include <util/fs.h>
+#include <util/overflow.h>
 #include <util/sock.h>
 #include <util/strencodings.h>
 #include <util/thread.h>
@@ -211,7 +212,7 @@ static std::vector<CAddress> ConvertSeeds(const std::vector<uint8_t> &vSeedsIn)
     while (!s.eof()) {
         CService endpoint;
         s >> endpoint;
-        CAddress addr{endpoint, SeedsServiceFlags()};
+        CAddress addr{endpoint, SeedsAssumedServiceFlags()};
         addr.nTime = rng.rand_uniform_delay(Now<NodeSeconds>() - one_week, -one_week);
         LogDebug(BCLog::NET, "Added hardcoded seed: %s\n", addr.ToStringAddrPort());
         vSeedsOut.push_back(addr);
@@ -228,7 +229,7 @@ CService GetLocalAddress(const CNode& peer)
     return GetLocal(peer).value_or(CService{CNetAddr(), GetListenPort()});
 }
 
-int GetnScore(const CService& addr)
+static int GetnScore(const CService& addr)
 {
     LOCK(g_maplocalhost_mutex);
     const auto it = mapLocalHost.find(addr);
@@ -297,7 +298,7 @@ bool AddLocal(const CService& addr_, int nScore)
         fAlready = !is_newly_added;
         LocalServiceInfo &info = it->second;
         if (is_newly_added || nScore >= info.nScore) {
-            info.nScore = nScore + (is_newly_added ? 0 : 1);
+            info.nScore = SaturatingAdd(nScore, is_newly_added ? 0 : 1);
             info.nPort = addr.GetPort();
         }
     }
@@ -330,9 +331,7 @@ bool SeenLocal(const CService& addr)
     LOCK(g_maplocalhost_mutex);
     const auto it = mapLocalHost.find(addr);
     if (it == mapLocalHost.end()) return false;
-    if (it->second.nScore < std::numeric_limits<int>::max()) {
-        ++it->second.nScore;
-    }
+    it->second.nScore = SaturatingAdd(it->second.nScore, 1);
     return true;
 }
 
@@ -475,7 +474,10 @@ CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCo
     std::unique_ptr<i2p::sam::Session> i2p_transient_session;
 
     for (auto& target_addr: connect_to) {
-        if (DisableV1OnClearnet(target_addr.GetNetClass()) && !use_v2transport) {
+        const std::string_view dest_name{pszDest ? pszDest : ""};
+        if (RequiresV2Dest(target_addr, dest_name) && !use_v2transport) {
+            LogDebug(BCLog::NET, "skipping v1 connection to %s (-v2onlyclearnet)\n",
+                     target_addr.IsValid() ? target_addr.ToStringAddrPort() : std::string{dest_name});
             continue;
         }
         if (target_addr.IsValid()) {
@@ -1813,6 +1815,10 @@ void CConnman::CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,
             return std::find(m_onion_binds.begin(), m_onion_binds.end(), addr_bind) != m_onion_binds.end();
         }
     }();
+    // Without a -bind=...=onion listener, an onion inbound is an assumption about a listener that
+    // clearnet peers can reach too. A connection from the bind address itself comes from this host
+    // (such as a Tor daemon whose onion service points at that address), so it is not in doubt.
+    const bool inbound_onion_assumed{inbound_onion && m_onion_binds.empty() && CNetAddr{addr} != CNetAddr{addr_bind}};
 
     // Tor inbound connections do not reveal the peer's actual network address.
     // Therefore do not apply address-based whitelist permissions to them.
@@ -1821,7 +1827,10 @@ void CConnman::CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,
     {
         LOCK(m_nodes_mutex);
         for (const CNode* pnode : m_nodes) {
-            if (pnode->IsInboundConn()) nInbound++;
+            // A demoted stale outbound peer gave up its outbound
+            // slot, so it counts against the inbound limit here: it displaces an
+            // inbound slot while connected, keeping the total within -maxconnections.
+            if (pnode->IsInboundConn() || pnode->m_is_stale_outbound) nInbound++;
         }
     }
 
@@ -1903,6 +1912,7 @@ void CConnman::CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,
                                  .forced_inbound = forced,
                                  .recv_flood_size = nReceiveFloodSize,
                                  .use_v2transport = use_v2transport,
+                                 .inbound_onion_assumed = inbound_onion_assumed,
                              });
     pnode->AddRef();
     m_msgproc->InitializeNode(*pnode, local_services);
@@ -1944,12 +1954,13 @@ bool CConnman::AddConnection(const std::string& address, ConnectionType conn_typ
         break;
     } // no default case, so the compiler can warn about missing cases
 
-    // Count existing connections
-    int existing_connections = WITH_LOCK(m_nodes_mutex,
-                                         return std::count_if(m_nodes.begin(), m_nodes.end(), [conn_type](CNode* node) { return node->m_conn_type == conn_type; }););
-
-    // Max connections of specified type already exist
-    if (max_connections != std::nullopt && existing_connections >= max_connections) return false;
+    // Only lock and count when this connection type has a limit to enforce.
+    if (max_connections != std::nullopt) {
+        const int existing_connections = WITH_LOCK(m_nodes_mutex,
+                                                   return std::count_if(m_nodes.begin(), m_nodes.end(), [conn_type](CNode* node) { return node->m_conn_type == conn_type && node->CountsTowardOutboundTarget(); }););
+        // Max connections of specified type already exist
+        if (existing_connections >= *max_connections) return false;
+    }
 
     // Max total outbound connections already exist
     CSemaphoreGrant grant(*semOutbound, true);
@@ -1994,14 +2005,18 @@ void CConnman::DisconnectNodes()
                 // Add to reconnection list if appropriate. We don't reconnect right here, because
                 // the creation of a connection is a blocking operation (up to several seconds),
                 // and we don't want to hold up the socket handler thread for that long.
-                if (network_active && pnode->m_transport->ShouldReconnectV1() && !DisableV1OnClearnet(pnode->addr.GetNetClass())) {
-                    reconnections_to_add.push_back({
-                        .addr_connect = pnode->addr,
-                        .grant = std::move(pnode->grantOutbound),
-                        .destination = pnode->m_dest,
-                        .conn_type = pnode->m_conn_type,
-                        .use_v2transport = false});
-                    LogDebug(BCLog::NET, "retrying with v1 transport protocol for peer=%d\n", pnode->GetId());
+                if (network_active && pnode->m_transport->ShouldReconnectV1()) {
+                    if (RequiresV2Dest(pnode->addr, pnode->m_dest)) {
+                        LogDebug(BCLog::NET, "not retrying with v1 transport protocol for peer=%d (-v2onlyclearnet)\n", pnode->GetId());
+                    } else {
+                        reconnections_to_add.push_back({
+                            .addr_connect = pnode->addr,
+                            .grant = std::move(pnode->grantOutbound),
+                            .destination = pnode->m_dest,
+                            .conn_type = pnode->m_conn_type,
+                            .use_v2transport = false});
+                        LogDebug(BCLog::NET, "retrying with v1 transport protocol for peer=%d\n", pnode->GetId());
+                    }
                 }
 
                 // release outbound grant (if any)
@@ -2010,8 +2025,9 @@ void CConnman::DisconnectNodes()
                 // close socket and cleanup
                 pnode->CloseSocketDisconnect();
 
-                // update connection count by network
-                if (pnode->IsManualOrFullOutboundConn()) --m_network_conn_counts[pnode->addr.GetNetwork()];
+                // update connection count by network; stale peers already gave
+                // theirs up in DemoteToStaleOutbound()
+                if (pnode->IsManualOrFullOutboundConn() && pnode->CountsTowardOutboundTarget()) --m_network_conn_counts[pnode->addr.GetNetwork()];
 
                 // hold in disconnected pool until all refs are released
                 pnode->Release();
@@ -2324,7 +2340,7 @@ void CConnman::ThreadDNSAddressSeed()
                 break;
             }
 
-            outbound_connection_count = GetBIP110FullOutboundConnCount();
+            outbound_connection_count = GetFullOutboundConnCount();
             if (outbound_connection_count >= SEED_OUTBOUND_CONNECTION_THRESHOLD) {
                 LogPrintf("P2P peers available. Finished fetching data from seed nodes.\n");
                 break;
@@ -2337,13 +2353,20 @@ void CConnman::ThreadDNSAddressSeed()
     std::shuffle(seeds.begin(), seeds.end(), rng);
     int seeds_right_now = 0; // Number of seeds left before testing if we have enough connections
 
-    if (gArgs.GetBoolArg("-forcednsseed", DEFAULT_FORCEDNSSEED)) {
+    // Only a full node advertising NODE_BLAKE2B can serve the header chain past
+    // the BLAKE2b hard fork, so drive the DNS-seed cadence off the count of such
+    // peers in addrman rather than its total size. SeedsServiceFlags() is the
+    // desirable network/witness flags plus NODE_BLAKE2B, matching what the
+    // outbound selection loop requires. Counted up to the delay threshold (all
+    // the decision below needs) and skipped when -forcednsseed queries all.
+    const bool force_dnsseed{gArgs.GetBoolArg("-forcednsseed", DEFAULT_FORCEDNSSEED)};
+    const size_t blake2b_count{force_dnsseed ? 0 : addrman.CountAddr(SeedsServiceFlags(), DNSSEEDS_DELAY_PEER_THRESHOLD)};
+
+    if (force_dnsseed) {
         // When -forcednsseed is provided, query all.
         seeds_right_now = seeds.size();
-    } else if (addrman.Size() == 0) {
-        // If we have no known peers, query all.
-        // This will occur on the first run, or if peers.dat has been
-        // deleted.
+    } else if (blake2b_count == 0) {
+        // No peers that can serve headers past the hard fork (incl. an empty addrman): query all.
         seeds_right_now = seeds.size();
     }
 
@@ -2362,7 +2385,7 @@ void CConnman::ThreadDNSAddressSeed()
         //   DNS seeds, and if that fails too, also try the fixed seeds.
         //   (done in ThreadOpenConnections)
         int found = 0;
-        const std::chrono::seconds seeds_wait_time = (addrman.Size() >= DNSSEEDS_DELAY_PEER_THRESHOLD ? DNSSEEDS_DELAY_MANY_PEERS : DNSSEEDS_DELAY_FEW_PEERS);
+        const std::chrono::seconds seeds_wait_time = (blake2b_count >= DNSSEEDS_DELAY_PEER_THRESHOLD ? DNSSEEDS_DELAY_MANY_PEERS : DNSSEEDS_DELAY_FEW_PEERS);
 
         for (const std::string& seed : seeds) {
             if (seeds_right_now == 0) {
@@ -2379,7 +2402,7 @@ void CConnman::ThreadDNSAddressSeed()
                         if (!interruptNet.sleep_for(w)) return;
                         to_wait -= w;
 
-                        if (GetBIP110FullOutboundConnCount() >= SEED_OUTBOUND_CONNECTION_THRESHOLD) {
+                        if (GetFullOutboundConnCount() >= SEED_OUTBOUND_CONNECTION_THRESHOLD) {
                             if (found > 0) {
                                 LogPrintf("%d addresses found from DNS seeds\n", found);
                                 LogPrintf("P2P peers available. Finished DNS seeding.\n");
@@ -2423,7 +2446,7 @@ void CConnman::ThreadDNSAddressSeed()
                 const auto addresses{LookupHost(host, nMaxIPs, true)};
                 if (!addresses.empty()) {
                     for (const CNetAddr& ip : addresses) {
-                        CAddress addr = CAddress(CService(ip, m_params.GetDefaultPort()), requiredServiceBits);
+                        CAddress addr = CAddress(CService(ip, m_params.GetDefaultPort()), SeedsAssumedServiceFlags());
                         addr.nTime = rng.rand_uniform_delay(Now<NodeSeconds>() - 3 * 24h, -4 * 24h); // use a random age between 3 and 7 days old
                         vAdd.push_back(addr);
                         found++;
@@ -2492,15 +2515,15 @@ void CConnman::StartExtraBlockRelayPeers()
     m_start_extra_block_relay_peers = true;
 }
 
-// Return the number of BIP110 outbound connections that are full relay (not blocks only).
-// Non-BIP110 outbound peers are excluded as they are "additional" and don't count toward limits.
-int CConnman::GetBIP110FullOutboundConnCount() const
+// Return the number of preferred outbound connections that are full relay (not blocks only).
+// Stale outbound peers are excluded as they are "additional" and don't count toward limits.
+int CConnman::GetFullOutboundConnCount() const
 {
     int nRelevant = 0;
     {
         LOCK(m_nodes_mutex);
         for (const CNode* pnode : m_nodes) {
-            if (pnode->fSuccessfullyConnected && pnode->IsFullOutboundConn() && !pnode->m_is_non_bip110_outbound) ++nRelevant;
+            if (pnode->fSuccessfullyConnected && pnode->IsFullOutboundConn() && pnode->CountsTowardOutboundTarget()) ++nRelevant;
         }
     }
     return nRelevant;
@@ -2518,7 +2541,7 @@ int CConnman::GetExtraFullOutboundCount() const
     {
         LOCK(m_nodes_mutex);
         for (const CNode* pnode : m_nodes) {
-            if (pnode->fSuccessfullyConnected && !pnode->fDisconnect && pnode->IsFullOutboundConn()) {
+            if (pnode->fSuccessfullyConnected && !pnode->fDisconnect && pnode->IsFullOutboundConn() && pnode->CountsTowardOutboundTarget()) {
                 ++full_outbound_peers;
             }
         }
@@ -2532,12 +2555,83 @@ int CConnman::GetExtraBlockRelayCount() const
     {
         LOCK(m_nodes_mutex);
         for (const CNode* pnode : m_nodes) {
-            if (pnode->fSuccessfullyConnected && !pnode->fDisconnect && pnode->IsBlockOnlyConn()) {
+            if (pnode->fSuccessfullyConnected && !pnode->fDisconnect && pnode->IsBlockOnlyConn() && pnode->CountsTowardOutboundTarget()) {
                 ++block_relay_peers;
             }
         }
     }
     return std::max(block_relay_peers - m_max_outbound_block_relay, 0);
+}
+
+CConnman::StaleOutboundRoom CConnman::CheckStaleOutboundRoom(ConnectionType conn_type, unsigned int max_stale, const CNode* exclude) const
+{
+    AssertLockHeld(m_nodes_mutex);
+    // The stale count is derived from the flag rather than kept in a separate
+    // counter, so it can never drift out of sync with the connections it
+    // describes. num_stale is unsigned to match max_stale (-maxstaleoutbound);
+    // inbound_equiv is int to match m_max_inbound, so neither comparison trips
+    // -Wsign-compare.
+    StaleOutboundRoom room;
+    int inbound_equiv{0};
+    int same_target{0};
+    for (const CNode* pnode : m_nodes) {
+        if (pnode == exclude || pnode->fDisconnect) continue;
+        // A demoted stale peer draws on the inbound budget, like a real inbound.
+        if (pnode->m_is_stale_outbound) {
+            ++room.num_stale;
+            ++inbound_equiv;
+        } else if (pnode->IsInboundConn()) {
+            ++inbound_equiv;
+        }
+        // Peers filling this outbound target, preferred or stale alike: a demoted
+        // peer keeps its connection type.
+        if (pnode->m_conn_type == conn_type) ++same_target;
+    }
+    Assume(conn_type == ConnectionType::OUTBOUND_FULL_RELAY || conn_type == ConnectionType::BLOCK_RELAY);
+    const int max_same_target{conn_type == ConnectionType::OUTBOUND_FULL_RELAY ? m_max_outbound_full_relay : m_max_outbound_block_relay};
+    if (room.num_stale >= max_stale) {
+        room.refusal = strprintf("already have %u stale outbound peers (limit %u)", room.num_stale, max_stale);
+    } else if (same_target >= max_same_target) {
+        // Tolerating a stale peer is only worthwhile while it fills a gap in the
+        // outbound target. Once that target is met, by preferred peers, already
+        // tolerated stale ones, or a mix, another stale peer buys us nothing.
+        room.refusal = strprintf("the outbound target is already full (%d/%d)", same_target, max_same_target);
+    } else if (inbound_equiv >= m_max_inbound) {
+        // Demoting releases the outbound slot, which we then refill toward the
+        // outbound target, so the peer must fit the inbound budget or a later
+        // outbound connection would push us past -maxconnections.
+        room.refusal = "no room within -maxconnections";
+    }
+    return room;
+}
+
+bool CConnman::CanTolerateStaleOutbound(ConnectionType conn_type, unsigned int max_stale) const
+{
+    LOCK(m_nodes_mutex);
+    return !CheckStaleOutboundRoom(conn_type, max_stale, /*exclude=*/nullptr).refusal.has_value();
+}
+
+bool CConnman::DemoteToStaleOutbound(CNode& node, unsigned int max_stale)
+{
+    // The version handler rejects a redundant VERSION before the stale gate, so
+    // a peer is never demoted twice; assert that rather than guarding for it.
+    Assert(!node.m_is_stale_outbound);
+    // m_nodes_mutex guards grantOutbound and m_network_conn_counts, and lets us
+    // count peers without racing the socket handler.
+    LOCK(m_nodes_mutex);
+    if (node.fDisconnect) return false;
+    const StaleOutboundRoom room{CheckStaleOutboundRoom(node.m_conn_type, max_stale, &node)};
+    if (room.refusal) {
+        LogDebug(BCLog::NET, "peer lacks NODE_BLAKE2B and %s, %s\n", *room.refusal, node.DisconnectMsg(fLogIPs));
+        node.fDisconnect = true;
+        return false;
+    }
+    node.m_is_stale_outbound = true;
+    node.grantOutbound.Release();
+    if (node.IsManualOrFullOutboundConn()) --m_network_conn_counts[node.addr.GetNetwork()];
+    LogDebug(BCLog::NET, "connected to stale outbound peer (%u/%u), %s\n",
+             room.num_stale + 1, max_stale, node.ConnectionTypeAsString());
+    return true;
 }
 
 std::unordered_set<Network> CConnman::GetReachableEmptyNetworks() const
@@ -2559,9 +2653,17 @@ bool CConnman::MultipleManualOrFullOutboundConns(Network net) const
     return m_network_conn_counts[net] > 1;
 }
 
-bool CConnman::DisableV1OnClearnet(Network net) const
+bool CConnman::RequiresV2Peer(Network net) const
 {
-    return disable_v1conn_clearnet && (net == NET_IPV4 || net == NET_IPV6);
+    return m_v2only_clearnet && IsClearnet(net);
+}
+
+bool CConnman::RequiresV2Dest(const CNetAddr& addr, std::string_view dest_name) const
+{
+    // A name proxy resolves the destination for us, so we can't tell locally which
+    // network it belongs to. Assume clearnet, the worst case.
+    if (!addr.IsValid() && !dest_name.empty()) return m_v2only_clearnet;
+    return RequiresV2Peer(addr.GetNetClass());
 }
 
 bool CConnman::MaybePickPreferredNetwork(std::optional<Network>& network)
@@ -2708,9 +2810,9 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect, Spa
         {
             LOCK(m_nodes_mutex);
             for (const CNode* pnode : m_nodes) {
-                // Non-BIP110 outbound peers are "additional" - don't count toward limits
-                if (pnode->IsFullOutboundConn() && !pnode->m_is_non_bip110_outbound) nOutboundFullRelay++;
-                if (pnode->IsBlockOnlyConn()) nOutboundBlockRelay++;
+                // Stale outbound peers are "additional" - don't count toward limits
+                if (pnode->IsFullOutboundConn() && pnode->CountsTowardOutboundTarget()) nOutboundFullRelay++;
+                if (pnode->IsBlockOnlyConn() && pnode->CountsTowardOutboundTarget()) nOutboundBlockRelay++;
 
                 // Make sure our persistent outbound slots to ipv4/ipv6 peers belong to different netgroups.
                 switch (pnode->m_conn_type) {
@@ -2820,6 +2922,18 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect, Spa
             continue;
         }
 
+        // Only a NODE_BLAKE2B peer can fill a persistent outbound slot: any other
+        // is demoted to stale at the handshake and stops counting towards the
+        // target, so prefer one for every slot of it. The extra peers opened past
+        // the target are the same two types, and one without the bit is refused
+        // outright there because the target is full, so prefer one for those too.
+        const bool prefer_blake2b{conn_type == ConnectionType::OUTBOUND_FULL_RELAY || conn_type == ConnectionType::BLOCK_RELAY};
+        // Falling back to a peer without it after enough tries is what bootstraps
+        // a node that can find none, but that only helps while the peer would be
+        // kept: once it would be dropped at the handshake instead, we would
+        // reconnect to the network twice a second for nothing.
+        const bool blake2b_required{prefer_blake2b && !m_msgproc->CanTolerateStaleOutbound(conn_type)};
+
         addrman.ResolveCollisions();
 
         const auto current_time{NodeClock::now()};
@@ -2892,8 +3006,11 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect, Spa
                 continue;
             }
 
-            // only consider very recently tried nodes after 30 failed attempts
-            if (current_time - addr_last_try < 10min && nTries < 30) {
+            // only consider very recently tried nodes after 30 failed attempts,
+            // unless we need NODE_BLAKE2B: an address that claims it but never
+            // completes a handshake is never corrected by SetServices, so
+            // relaxing this would re-dial it every pass
+            if (current_time - addr_last_try < 10min && (nTries < 30 || blake2b_required)) {
                 continue;
             }
 
@@ -2903,6 +3020,10 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect, Spa
             if (!fFeeler && !m_msgproc->HasAllDesirableServiceFlags(addr.nServices)) {
                 continue;
             } else if (fFeeler && !MayHaveUsefulAddressDB(addr.nServices)) {
+                continue;
+            }
+
+            if (prefer_blake2b && !(addr.nServices & NODE_BLAKE2B) && (nTries < 30 || blake2b_required)) {
                 continue;
             }
 
@@ -2954,7 +3075,8 @@ std::vector<CAddress> CConnman::GetCurrentBlockRelayOnlyConns() const
     std::vector<CAddress> ret;
     LOCK(m_nodes_mutex);
     for (const CNode* pnode : m_nodes) {
-        if (pnode->IsBlockOnlyConn()) {
+        // Anchors are re-connected on startup as our anti-eclipse peers.
+        if (pnode->IsBlockOnlyConn() && pnode->CountsTowardOutboundTarget()) {
             ret.push_back(pnode->addr);
         }
     }
@@ -3913,6 +4035,7 @@ CNode::CNode(NodeId idIn,
       m_addr_name{addrNameIn.empty() ? addr.ToStringAddrPort() : addrNameIn},
       m_dest(addrNameIn),
       m_inbound_onion{inbound_onion},
+      m_inbound_onion_assumed{inbound_onion && node_opts.inbound_onion_assumed},
       m_prefer_evict{node_opts.prefer_evict},
       m_forced_inbound{node_opts.forced_inbound},
       nKeyedNetGroup{nKeyedNetGroupIn},

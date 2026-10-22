@@ -6,11 +6,13 @@
 #ifndef BITCOIN_CONSENSUS_PARAMS_H
 #define BITCOIN_CONSENSUS_PARAMS_H
 
+#include <consensus/consensus.h>
 #include <uint256.h>
 
 #include <chrono>
 #include <limits>
 #include <map>
+#include <string>
 #include <vector>
 
 namespace Consensus {
@@ -26,13 +28,13 @@ enum BuriedDeployment : int16_t {
     DEPLOYMENT_DERSIG,
     DEPLOYMENT_CSV,
     DEPLOYMENT_SEGWIT,
+    DEPLOYMENT_BLAKE2B,
 };
-constexpr bool ValidDeployment(BuriedDeployment dep) { return dep <= DEPLOYMENT_SEGWIT; }
+constexpr bool ValidDeployment(BuriedDeployment dep) { return dep <= DEPLOYMENT_BLAKE2B; }
 
 enum DeploymentPos : uint16_t {
     DEPLOYMENT_TESTDUMMY,
     DEPLOYMENT_TAPROOT, // Deployment of Schnorr/Taproot (BIPs 340-342)
-    DEPLOYMENT_REDUCED_DATA, // ReducedData Temporary Softfork (RDTS)
     // NOTE: Also add new deployments to VersionBitsDeploymentInfo in deploymentinfo.cpp
     MAX_VERSION_BITS_DEPLOYMENTS
 };
@@ -80,6 +82,34 @@ struct BIP9Deployment {
 };
 
 /**
+ * Chainstate record of deployment enforcement.
+ *
+ * NOTE: Currently this only turns "valid" into "indeterminate" (and only
+ * for ConnectBlock checks). It cannot turn "invalid" into "indeterminate"
+ * and therefore is not safe to use for hardforks, only softforks.
+ */
+struct ChainstateRevalidationDeployment {
+    /** Deployment name used for persisted state.
+     *
+     * Note that if enforcement isn't exactly the same (eg, an earlier
+     * CoinbaseMaturityLongStartHeight), this must be changed.
+     */
+    std::string name;
+    /**
+     * First block height whose cached validation may be invalidated.
+     *
+     * The current revalidation framework only demotes cached validation back
+     * to BLOCK_VALID_TRANSACTIONS. It is only appropriate for deployments
+     * whose new checks are re-run by ConnectBlock() after that point. Rules
+     * checked by CheckBlock() or ContextualCheckBlock() need additional block
+     * index support before they can use this safely.
+     */
+    int start_height{std::numeric_limits<int>::max()};
+    /** Last block height whose cached validation may be invalidated. */
+    int stop_height{std::numeric_limits<int>::max()};
+};
+
+/**
  * Parameters that influence chain consensus.
  */
 struct Params {
@@ -105,6 +135,55 @@ struct Params {
      * Note that segwit v0 script rules are enforced on all blocks except the
      * BIP 16 exception blocks. */
     int SegwitHeight;
+    /** Block height at which BLAKE2b hardfork becomes active */
+    int Blake2bHeight{std::numeric_limits<int>::max()};
+    std::vector<unsigned char> Blake2bHeadline;
+    uint8_t Blake2bTargetShift{20};
+    /**
+     * RDTS (BIP110 ReducedData Temporary Softfork) deployment expiry.
+     *
+     * At the BLAKE2b hardfork RDTS stops using versionbits: its rules are
+     * enforced for exactly the blocks from Blake2bHeight (see RdtsActiveAt)
+     * until expiry. A block is past expiry when its parent's median-time-past
+     * has reached RdtsExpiryTime, so the boundary is monotone along any chain
+     * and the rules for the next block are knowable in advance.
+     *
+     * The default leaves the deployment unscheduled (expiry precedes every
+     * median-time-past, and Blake2bHeight itself defaults to unscheduled), so
+     * behaviour is unchanged on chains that do not set it.
+     */
+    int64_t RdtsExpiryTime{std::numeric_limits<int64_t>::min()};
+    int CoinbaseMaturityLong{COINBASE_MATURITY};
+    int CoinbaseMaturityLongStartHeight{std::numeric_limits<int>::max()};
+    int CoinbaseMaturityLongEnforceHeight{std::numeric_limits<int>::max()};
+    int CoinbaseMaturityLongReleaseHeight{std::numeric_limits<int>::max()};
+    // Preserve mainnet's pre-existing height-bounded rule when adding a later rule.
+    int CoinbaseMaturityHistoricalStartHeight{std::numeric_limits<int>::max()};
+    int CoinbaseMaturityHistoricalReleaseHeight{std::numeric_limits<int>::max()};
+    bool CoinbaseMaturityHistoricalActiveAt(int height) const
+    {
+        return height >= CoinbaseMaturityHistoricalStartHeight && height < CoinbaseMaturityHistoricalReleaseHeight;
+    }
+    // Short 100-block band between the historical 180-day window and the resumed 180-day rule.
+    int CoinbaseMaturityShortStartHeight{std::numeric_limits<int>::max()};
+    int CoinbaseMaturityShortEndHeight{std::numeric_limits<int>::max()};
+    bool CoinbaseMaturityShortActiveAt(int height) const
+    {
+        return height >= CoinbaseMaturityShortStartHeight && height < CoinbaseMaturityShortEndHeight;
+    }
+    int CoinbaseMaturityBeforeRolling() const
+    {
+        return CoinbaseMaturityHistoricalStartHeight != std::numeric_limits<int>::max()
+            ? CoinbaseMaturityHistoricalReleaseHeight - CoinbaseMaturityHistoricalStartHeight
+            : CoinbaseMaturityLong;
+    }
+    /** Bind long maturity to the mining block's parent MTP, retaining it after RDTS expires. */
+    bool CoinbaseMaturityLongUntilRdts{false};
+    bool CoinbaseMaturityLongActiveAt(int height) const
+    {
+        return height >= CoinbaseMaturityLongEnforceHeight && (CoinbaseMaturityLongUntilRdts || height < CoinbaseMaturityLongReleaseHeight);
+    }
+    std::vector<ChainstateRevalidationDeployment> chainstate_revalidation_deployments;
     /** Don't warn about unknown BIP 9 activations below this height.
      * This prevents us from warning about the CSV and segwit activations. */
     int MinBIP9WarningHeight;
@@ -157,8 +236,25 @@ struct Params {
             return CSVHeight;
         case DEPLOYMENT_SEGWIT:
             return SegwitHeight;
+        case DEPLOYMENT_BLAKE2B:
+            return Blake2bHeight;
         } // no default case, so the compiler can warn about missing cases
         return std::numeric_limits<int>::max();
+    }
+
+    bool IsBlake2bHeight(int height) const
+    {
+        return height >= Blake2bHeight;
+    }
+
+    /** RDTS activates at the BLAKE2b hardfork; there is no separate schedule. */
+    int RdtsActivationHeight() const { return Blake2bHeight; }
+
+    /** Whether the RDTS rules apply to a block at the given height whose
+     *  parent has the given median-time-past. */
+    bool RdtsActiveAt(int height, int64_t mtp_prev) const
+    {
+        return IsBlake2bHeight(height) && mtp_prev < RdtsExpiryTime;
     }
 };
 

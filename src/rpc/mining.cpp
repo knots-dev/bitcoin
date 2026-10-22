@@ -427,7 +427,8 @@ static RPCHelpMan getmininginfo()
                         {RPCResult::Type::NUM, "currentblockweight", /*optional=*/true, "The block weight (including reserved weight for block header, txs count and coinbase tx) of the last assembled block (only present if a block was ever assembled)"},
                         {RPCResult::Type::NUM, "currentblocktx", /*optional=*/true, "The number of block transactions (excluding coinbase) of the last assembled block (only present if a block was ever assembled)"},
                         {RPCResult::Type::STR_HEX, "bits", "The current nBits, compact representation of the block difficulty target"},
-                        {RPCResult::Type::NUM, "difficulty", "The current difficulty"},
+                        {RPCResult::Type::NUM, "difficulty", /*optional=*/true, "The proof-of-work difficulty as a multiple of the minimum difficulty (only for SHA256d blocks)"},
+                        {RPCResult::Type::NUM, "difficulty_blake2b", /*optional=*/true, "The expected average number of BLAKE2b hashes needed to find the tip block (only for header-v2 blocks)"},
                         {RPCResult::Type::STR_HEX, "target", "The current target"},
                         {RPCResult::Type::NUM, "networkhashps", "The network hashes per second"},
                         {RPCResult::Type::NUM, "pooledtx", "The size of the mempool"},
@@ -437,7 +438,8 @@ static RPCHelpMan getmininginfo()
                         {
                             {RPCResult::Type::NUM, "height", "The next height"},
                             {RPCResult::Type::STR_HEX, "bits", "The next target nBits"},
-                            {RPCResult::Type::NUM, "difficulty", "The next difficulty"},
+                            {RPCResult::Type::NUM, "difficulty", /*optional=*/true, "The proof-of-work difficulty as a multiple of the minimum difficulty (only for SHA256d blocks)"},
+                            {RPCResult::Type::NUM, "difficulty_blake2b", /*optional=*/true, "The expected average number of BLAKE2b hashes needed to find the next block (only for header-v2 blocks)"},
                             {RPCResult::Type::STR_HEX, "target", "The next target"}
                         }},
                         (IsDeprecatedRPCEnabled("warnings") ?
@@ -468,7 +470,7 @@ static RPCHelpMan getmininginfo()
     if (BlockAssembler::m_last_block_weight) obj.pushKV("currentblockweight", *BlockAssembler::m_last_block_weight);
     if (BlockAssembler::m_last_block_num_txs) obj.pushKV("currentblocktx", *BlockAssembler::m_last_block_num_txs);
     obj.pushKV("bits", strprintf("%08x", tip.nBits));
-    obj.pushKV("difficulty", GetDifficulty(tip));
+    PushDifficulty(obj, tip);
     obj.pushKV("target", GetTarget(tip, chainman.GetConsensus().powLimit).GetHex());
     obj.pushKV("networkhashps",    getnetworkhashps().HandleRequest(request));
     obj.pushKV("pooledtx",         (uint64_t)mempool.size());
@@ -480,7 +482,7 @@ static RPCHelpMan getmininginfo()
 
     next.pushKV("height", next_index.nHeight);
     next.pushKV("bits", strprintf("%08x", next_index.nBits));
-    next.pushKV("difficulty", GetDifficulty(next_index));
+    PushDifficulty(next, next_index);
     next.pushKV("target", GetTarget(next_index, chainman.GetConsensus().powLimit).GetHex());
     obj.pushKV("next", next);
 
@@ -643,6 +645,7 @@ static RPCHelpMan getblocktemplate()
                 {"rules", RPCArg::Type::ARR, RPCArg::Optional::NO, "A list of strings",
                 {
                     {"segwit", RPCArg::Type::STR, RPCArg::Optional::NO, "(literal) indicates client side segwit support"},
+                    {"blake2b", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "(literal) indicates client side BLAKE2b header support"},
                     {"str", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "other client side supported softfork deployment"},
                 }},
                 {"longpollid", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "delay processing request until the result would vary significantly from the \"longpollid\" of a prior template"},
@@ -1018,6 +1021,12 @@ static UniValue TemplateToJSON(const Consensus::Params& consensusParams, const C
         // when attempting to mine with this template
         aRules.push_back("!signet");
     }
+    if (block.m_header_v2) {
+        aRules.push_back("!blake2b");
+        if (!setClientRules.count("blake2b")) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Support for 'blake2b' rule requires explicit client support");
+        }
+    }
 
     UniValue vbavailable(UniValue::VOBJ);
     uint32_t vbrequired = 0;
@@ -1064,7 +1073,23 @@ static UniValue TemplateToJSON(const Consensus::Params& consensusParams, const C
             }
         }
     }
-    result.pushKV("version", block_header.nVersion);
+    // RDTS (now a flag-day deployment; no signalling surface remains). When
+    // RDTS is active for the template's block, the rules were enforced
+    // during transaction selection: advertise
+    // "reduced_data" unprefixed, as before the deployment's removal
+    // (gbt_force semantics: clients need no special support, there is no
+    // client-side block construction involved).
+    const bool rdts_active{pindexPrev != nullptr &&
+        consensusParams.RdtsActiveAt(pindexPrev->nHeight + 1, pindexPrev->GetMedianTimePast())};
+    if (rdts_active) {
+        aRules.push_back("reduced_data");
+    }
+    if (pindexPrev != nullptr && (consensusParams.CoinbaseMaturityLongActiveAt(pindexPrev->nHeight + 1) ||
+                                   consensusParams.CoinbaseMaturityHistoricalActiveAt(pindexPrev->nHeight + 1))) {
+        aRules.push_back("long_coinbase_maturity");
+    }
+
+    result.pushKV("version", block_header.GetCompleteVersion());
     result.pushKV("rules", std::move(aRules));
     result.pushKV("vbavailable", std::move(vbavailable));
     result.pushKV("vbrequired", vbrequired);
@@ -1089,7 +1114,9 @@ static UniValue TemplateToJSON(const Consensus::Params& consensusParams, const C
     result.pushKV("sigoplimit", nSigOpLimit);
     result.pushKV("sizelimit", nSizeLimit);
     if (!fPreSegWit) {
-        result.pushKV("weightlimit", (int64_t)MAX_BLOCK_WEIGHT);
+        // While RDTS is active the consensus weight limit is reduced;
+        // external miners (e.g. DATUM) must see the real cap.
+        result.pushKV("weightlimit", (int64_t)(rdts_active ? REDUCED_DATA_MAX_BLOCK_WEIGHT : MAX_BLOCK_WEIGHT));
     }
     result.pushKV("curtime", block_header.GetBlockTime());
     result.pushKV("bits", strprintf("%08x", block_header.nBits));

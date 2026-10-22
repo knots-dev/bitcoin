@@ -38,6 +38,7 @@ add_executable(fuzz
   crypto_hkdf_hmac_sha256_l32.cpp
   crypto_poly1305.cpp
   cuckoocache.cpp
+  datacarrier_dead_branch.cpp
   decode_tx.cpp
   descriptor_parse.cpp
   deserialize.cpp
@@ -101,6 +102,7 @@ add_executable(fuzz
   script_descriptor_cache.cpp
   script_flags.cpp
   script_format.cpp
+  unified_sighash.cpp
   script_interpreter.cpp
   script_ops.cpp
   script_parsing.cpp

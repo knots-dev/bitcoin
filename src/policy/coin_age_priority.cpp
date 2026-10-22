@@ -154,13 +154,13 @@ bool BlockAssembler::TestForBlock(CTxMemPool::txiter iter)
         // If the block is so close to full that no more txs will fit
         // or if we've tried more than 50 times to fill remaining space
         // then flag that the block is finished
-        if (nBlockWeight > m_options.nBlockMaxWeight - 400 || nBlockSigOpsCost > MAX_BLOCK_SIGOPS_COST - 8 || lastFewTxs > 50) {
+        if (nBlockWeight > m_effective_max_weight - 400 || nBlockSigOpsCost > MAX_BLOCK_SIGOPS_COST - 8 || lastFewTxs > 50) {
              blockFinished = true;
              return false;
         }
         // Once we're within 4000 weight of a full block, only look at 50 more txs
         // to try to fill the remaining space.
-        if (nBlockWeight > m_options.nBlockMaxWeight - 4000) {
+        if (nBlockWeight > m_effective_max_weight - 4000) {
             ++lastFewTxs;
         }
         return false;
@@ -186,8 +186,8 @@ void BlockAssembler::addPriorityTxs(const CTxMemPool& mempool, int &nPackagesSel
 {
     AssertLockHeld(mempool.cs);
 
-    // How much of the block should be dedicated to high-priority transactions,
-    // included regardless of the fees they pay
+    // How much of the block should be dedicated to high-priority transactions
+    // meeting the mining fee floor.
     uint64_t nBlockPrioritySize = gArgs.GetIntArg("-blockprioritysize", DEFAULT_BLOCK_PRIORITY_SIZE);
     if (m_options.nBlockMaxSize < nBlockPrioritySize) {
         nBlockPrioritySize = m_options.nBlockMaxSize;
@@ -209,6 +209,12 @@ void BlockAssembler::addPriorityTxs(const CTxMemPool& mempool, int &nPackagesSel
 
     vecPriority.reserve(mempool.mapTx.size());
     for (auto mi = mempool.mapTx.begin(); mi != mempool.mapTx.end(); ++mi) {
+        // Use the same modified fees and policy vsize as package selection.
+        // Below-floor parents remain eligible through fee-paying descendants
+        // in addPackageTxs, rather than being selected individually here.
+        if (mi->GetModifiedFee() < m_options.blockMinFeeRate.GetFee(mi->GetTxSize())) {
+            continue;
+        }
         double dPriority = mi->GetPriority(nHeight);
         CAmount dummy;
         mempool.ApplyDeltas(mi->GetTx().GetHash(), dPriority, dummy);

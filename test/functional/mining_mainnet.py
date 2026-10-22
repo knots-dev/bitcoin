@@ -44,7 +44,6 @@ class MiningMainnetTest(BitcoinTestFramework):
         self.num_nodes = 1
         self.setup_clean_chain = True
         self.chain = "" # main
-        self.extra_args = [['-consensusrules=rdts']] * self.num_nodes
 
     def add_options(self, parser):
         parser.add_argument(
@@ -97,11 +96,13 @@ class MiningMainnetTest(BitcoinTestFramework):
         self.log.info("Check difficulty adjustment with getmininginfo")
         mining_info = node.getmininginfo()
         assert_equal(mining_info['difficulty'], 1)
+        assert 'difficulty_blake2b' not in mining_info
         assert_equal(mining_info['bits'], nbits_str(DIFF_1_N_BITS))
         assert_equal(mining_info['target'], target_str(DIFF_1_TARGET))
 
         assert_equal(mining_info['next']['height'], 2016)
         assert_equal(mining_info['next']['difficulty'], 4)
+        assert 'difficulty_blake2b' not in mining_info['next']
         assert_equal(mining_info['next']['bits'], nbits_str(DIFF_4_N_BITS))
         assert_equal(mining_info['next']['target'], target_str(DIFF_4_TARGET))
 
@@ -112,11 +113,13 @@ class MiningMainnetTest(BitcoinTestFramework):
 
         mining_info = node.getmininginfo()
         assert_equal(mining_info['difficulty'], 4)
+        assert 'difficulty_blake2b' not in mining_info
 
         self.log.info("getblock RPC should show historical target")
         block_info = node.getblock(node.getblockhash(1))
 
         assert_equal(block_info['difficulty'], 1)
+        assert 'difficulty_blake2b' not in block_info
         assert_equal(block_info['bits'], nbits_str(DIFF_1_N_BITS))
         assert_equal(block_info['target'], target_str(DIFF_1_TARGET))
 

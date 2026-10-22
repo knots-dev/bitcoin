@@ -356,6 +356,9 @@ struct Peer {
     /** Whether we've sent this peer a getheaders in response to an inv prior to initial-headers-sync completing */
     bool m_inv_triggered_getheaders_before_sync GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
 
+    /** Whether we've requested this stale peer's highest usable header. */
+    bool m_stale_peer_probe_sent GUARDED_BY(NetEventsInterface::g_msgproc_mutex){false};
+
     /** Protects m_getdata_requests **/
     Mutex m_getdata_requests_mutex;
     /** Work queue of items requested by this peer **/
@@ -493,6 +496,7 @@ public:
     void InitializeNode(const CNode& node, ServiceFlags our_services) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_tx_download_mutex);
     void FinalizeNode(const CNode& node) override EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_headers_presync_mutex, !m_tx_download_mutex);
     bool HasAllDesirableServiceFlags(ServiceFlags services) const override;
+    bool CanTolerateStaleOutbound(ConnectionType conn_type) const override;
     bool ProcessMessages(CNode* pfrom, std::atomic<bool>& interrupt) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, !m_most_recent_block_mutex, !m_headers_presync_mutex, g_msgproc_mutex, !m_tx_download_mutex);
     bool SendMessages(CNode* pto) override
@@ -671,7 +675,11 @@ private:
      * We don't issue a getheaders message if we have a recent one outstanding.
      * This returns true if a getheaders is actually sent, and false otherwise.
      */
-    bool MaybeSendGetHeaders(CNode& pfrom, const CBlockLocator& locator, Peer& peer) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+    bool MaybeSendGetHeaders(CNode& pfrom, const CBlockLocator& locator, Peer& peer, const uint256& hash_stop = {}) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+    /** Highest block height we may share with this peer. */
+    int PeerBlockSharingHeightLimit(const Peer& peer) const;
+    /** Whether we may sync headers from this peer (always, unless BLAKE2b is scheduled). */
+    bool CanSyncHeadersFrom(const Peer& peer) const;
     /** Potentially fetch blocks from this peer upon receipt of a new headers tip */
     void HeadersDirectFetchBlocks(CNode& pfrom, const Peer& peer, const CBlockIndex& last_header);
     /** Update peer state based on received headers message */
@@ -798,9 +806,6 @@ private:
 
     /** Number of peers with wtxid relay. */
     std::atomic<int> m_wtxid_relay_peers{0};
-
-    /** Number of outbound peers without NODE_REDUCED_DATA (BIP-110). Limited to 2. */
-    std::atomic<unsigned int> m_num_non_bip110_outbound{0};
 
     /** Number of outbound peers with m_chain_sync.m_protect. */
     int m_outbound_peers_with_protect_from_disconnect GUARDED_BY(cs_main) = 0;
@@ -1106,6 +1111,22 @@ static void AddKnownTx(Peer& peer, const uint256& hash)
 static bool CanServeBlocks(const Peer& peer)
 {
     return peer.m_their_services & (NODE_NETWORK|NODE_NETWORK_LIMITED);
+}
+
+/** Whether this peer advertises support for our header chain. */
+static bool CanServeHeaders(const Peer& peer)
+{
+    return peer.m_their_services & NODE_BLAKE2B;
+}
+
+int PeerManagerImpl::PeerBlockSharingHeightLimit(const Peer& peer) const
+{
+    return CanServeHeaders(peer) ? std::numeric_limits<int>::max() : m_chainparams.StalePeerCommonHeight();
+}
+
+bool PeerManagerImpl::CanSyncHeadersFrom(const Peer& peer) const
+{
+    return CanServeHeaders(peer) || m_chainparams.StalePeerCommonHeight() == std::numeric_limits<int>::max();
 }
 
 /** Whether this peer can only serve limited recent blocks (e.g. because
@@ -1597,11 +1618,6 @@ void PeerManagerImpl::FinalizeNode(const CNode& node)
         assert(peer != nullptr);
         m_wtxid_relay_peers -= peer->m_wtxid_relay;
         assert(m_wtxid_relay_peers >= 0);
-        // Decrement non-BIP110 counter if this was a non-BIP110 outbound peer
-        if (node.m_is_non_bip110_outbound) {
-            assert(m_num_non_bip110_outbound > 0);
-            --m_num_non_bip110_outbound;
-        }
     }
     CNodeState *state = State(nodeid);
     assert(state != nullptr);
@@ -1661,6 +1677,11 @@ bool PeerManagerImpl::HasAllDesirableServiceFlags(ServiceFlags services) const
 {
     // Shortcut for (services & GetDesirableServiceFlags(services)) == GetDesirableServiceFlags(services)
     return !(GetDesirableServiceFlags(services) & (~services));
+}
+
+bool PeerManagerImpl::CanTolerateStaleOutbound(ConnectionType conn_type) const
+{
+    return m_connman.CanTolerateStaleOutbound(conn_type, m_opts.maxstaleoutbound);
 }
 
 ServiceFlags PeerManagerImpl::GetDesirableServiceFlags(ServiceFlags services) const
@@ -1883,14 +1904,18 @@ std::optional<std::string> PeerManagerImpl::FetchBlock(NodeId peer_id, const uin
 {
     if (m_chainman.m_blockman.LoadingBlocks()) return "Loading blocks ...";
 
+    // The lock must be taken here before fetching Peer so another thread does
+    // not delete the CNodeState from under the current thread, causing an
+    // assertion failure in BlockRequested. This lock can be replaced with a
+    // net-specific lock when more of CNodeState is moved into Peer.
+    LOCK(cs_main);
+
     // Ensure this peer exists and hasn't been disconnected
     PeerRef peer = GetPeerRef(peer_id);
     if (peer == nullptr) return "Peer does not exist";
 
     // Ignore pre-segwit peers
     if (!CanServeWitnesses(*peer)) return "Pre-SegWit peer";
-
-    LOCK(cs_main);
 
     if (IsBlockRequestedFromPeer(hash, peer_id)) return "Already requested from this peer";
 
@@ -2064,6 +2089,10 @@ void PeerManagerImpl::NewPoWValidBlock(const CBlockIndex *pindex, const std::sha
 
         if (pnode->GetCommonVersion() < INVALID_CB_NO_BAN_VERSION || pnode->fDisconnect)
             return;
+        if (pindex->nHeight > m_chainparams.StalePeerCommonHeight()) {
+            const PeerRef peer{GetPeerRef(pnode->GetId())};
+            if (!peer || !CanServeHeaders(*peer)) return;
+        }
         ProcessBlockAvailability(pnode->GetId());
         CNodeState &state = *State(pnode->GetId());
         // If the peer has, or we announced to them the previous block already,
@@ -2276,12 +2305,17 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
 
     const CBlockIndex* pindex{nullptr};
     const CBlockIndex* tip{nullptr};
+    const CBlockIndex* continuation_tip{nullptr};
     bool can_direct_fetch{false};
     FlatFilePos block_pos{};
     {
         LOCK(cs_main);
         pindex = m_chainman.m_blockman.LookupBlockIndex(inv.hash);
         if (!pindex) {
+            return;
+        }
+        const int block_sharing_height_limit{PeerBlockSharingHeightLimit(peer)};
+        if (pindex->nHeight > block_sharing_height_limit) {
             return;
         }
         if (!BlockRequestAllowed(pindex)) {
@@ -2298,6 +2332,10 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
             return;
         }
         tip = m_chainman.ActiveChain().Tip();
+        continuation_tip = tip;
+        if (tip->nHeight > block_sharing_height_limit) {
+            continuation_tip = m_chainman.ActiveChain()[block_sharing_height_limit];
+        }
         // Avoid leaking prune-height by never sending blocks below the NODE_NETWORK_LIMITED threshold
         if (!pfrom.HasPermission(NetPermissionFlags::NoBan) && (
                 (((peer.m_our_services & NODE_NETWORK_LIMITED) == NODE_NETWORK_LIMITED) && ((peer.m_our_services & NODE_NETWORK) != NODE_NETWORK) && (tip->nHeight - pindex->nHeight > (int)NODE_NETWORK_LIMITED_MIN_BLOCKS + 2 /* add two blocks buffer extension for possible races */) )
@@ -2404,7 +2442,7 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv& 
             // and we want it right after the last block so they don't
             // wait for other stuff first.
             std::vector<CInv> vInv;
-            vInv.emplace_back(MSG_BLOCK, tip->GetBlockHash());
+            vInv.emplace_back(MSG_BLOCK, continuation_tip->GetBlockHash());
             MakeAndPushMessage(pfrom, NetMsgType::INV, vInv);
             peer.m_continuation_block.SetNull();
         }
@@ -2690,7 +2728,7 @@ bool PeerManagerImpl::TryLowWorkHeadersSync(Peer& peer, CNode& pfrom, const CBlo
         // Only try to sync with this peer if their headers message was full;
         // otherwise they don't have more headers after this so no point in
         // trying to sync their too-little-work chain.
-        if (headers.size() == m_opts.max_headers_result) {
+        if (headers.size() == m_opts.max_headers_result && CanSyncHeadersFrom(peer)) {
             // Note: we could advance to the last header in this set that is
             // known to us, rather than starting at the first header (which we
             // may already have); however this is unlikely to matter much since
@@ -2733,14 +2771,16 @@ bool PeerManagerImpl::IsAncestorOfBestHeaderOrTip(const CBlockIndex* header)
     return false;
 }
 
-bool PeerManagerImpl::MaybeSendGetHeaders(CNode& pfrom, const CBlockLocator& locator, Peer& peer)
+bool PeerManagerImpl::MaybeSendGetHeaders(CNode& pfrom, const CBlockLocator& locator, Peer& peer, const uint256& hash_stop)
 {
+    if (!CanSyncHeadersFrom(peer) && hash_stop.IsNull()) return false;
+
     const auto current_time = NodeClock::now();
 
     // Only allow a new getheaders message to go out if we don't have a recent
     // one already in-flight
     if (current_time - peer.m_last_getheaders_timestamp > HEADERS_RESPONSE_TIME) {
-        MakeAndPushMessage(pfrom, NetMsgType::GETHEADERS, locator, uint256());
+        MakeAndPushMessage(pfrom, NetMsgType::GETHEADERS, locator, hash_stop);
         peer.m_last_getheaders_timestamp = current_time;
         return true;
     }
@@ -2859,7 +2899,9 @@ void PeerManagerImpl::UpdatePeerStateForReceivedHeaders(CNode& pfrom, Peer& peer
     // Note that outbound block-relay peers are excluded from this protection, and
     // thus always subject to eviction under the bad/lagging chain logic.
     // See ChainSyncTimeoutState.
-    if (!pfrom.fDisconnect && pfrom.IsFullOutboundConn() && nodestate->pindexBestKnownBlock != nullptr) {
+    // Stale peers are excluded, so they cannot take all the protect slots and
+    // leave the preferred peers we want to keep unprotected.
+    if (!pfrom.fDisconnect && pfrom.IsFullOutboundConn() && pfrom.CountsTowardOutboundTarget() && nodestate->pindexBestKnownBlock != nullptr) {
         if (m_outbound_peers_with_protect_from_disconnect < MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT && nodestate->pindexBestKnownBlock->nChainWork >= m_chainman.ActiveChain().Tip()->nChainWork && !nodestate->m_chain_sync.m_protect) {
             LogDebug(BCLog::NET, "Protecting outbound peer=%d from eviction\n", pfrom.GetId());
             nodestate->m_chain_sync.m_protect = true;
@@ -2995,6 +3037,13 @@ void PeerManagerImpl::ProcessHeadersMessage(CNode& pfrom, Peer& peer,
     BlockValidationState state;
     if (!m_chainman.ProcessNewBlockHeaders(headers, /*min_pow_checked=*/true, state, &pindexLast)) {
         if (state.IsInvalid()) {
+            if (!pfrom.IsInboundConn() && state.GetResult() == BlockValidationResult::BLOCK_CACHED_INVALID) {
+                // Warn user if outgoing peers send us headers of blocks that we previously marked as invalid.
+                LogWarning("%s (received from peer=%i). "
+                           "If this happens with all peers, consider database corruption (that -reindex may fix) "
+                           "or a potential consensus incompatibility.",
+                           state.GetDebugMessage(), pfrom.GetId());
+            }
             MaybePunishNodeForBlock(pfrom.GetId(), state, via_compact_block, "invalid header received");
             return;
         }
@@ -3509,6 +3558,17 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
             return;
         }
 
+        const bool is_v1transport = pfrom.m_transport->GetInfo().transport_type == TransportProtocolType::V1;
+        // An onion inbound that is only assumed (no -bind=...=onion) is also checked by its source address:
+        // Tor reaches us from this host or a private address, so a clearnet source means a clearnet peer.
+        const bool clearnet_v1{m_connman.RequiresV2Peer(pfrom.ConnectedThroughNetwork()) ||
+                               (pfrom.m_inbound_onion_assumed && m_connman.RequiresV2Peer(pfrom.addr.GetNetClass()))};
+        if (pfrom.IsInboundConn() && is_v1transport && clearnet_v1) {
+            LogDebug(BCLog::NET, "v1 connection from a clearnet peer not allowed (-v2onlyclearnet), %s", pfrom.DisconnectMsg(fLogIPs));
+            pfrom.fDisconnect = true;
+            return;
+        }
+
         if (pfrom.IsInboundConn() && addrMe.IsRoutable())
         {
             SeenLocal(addrMe);
@@ -3543,22 +3603,16 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         }
 
         pfrom.m_has_all_wanted_services = HasAllDesirableServiceFlags(nServices);
-        // BIP-110: Allow up to 2 non-BIP110 outbound peers.
-        if (pfrom.ExpectServicesFromConn() && !(nServices & NODE_REDUCED_DATA)) {
-            if (m_num_non_bip110_outbound >= m_opts.maxstaleoutbound) {
-                LogDebug(BCLog::NET, "peer lacks NODE_REDUCED_DATA and already have %u non-BIP110 outbound peers (limit %u), %s\n",
-                         m_num_non_bip110_outbound,
-                         m_opts.maxstaleoutbound,
-                         pfrom.DisconnectMsg(fLogIPs));
-                pfrom.fDisconnect = true;
+        // Tolerate up to -maxstaleoutbound outbound peers not enforcing the
+        // BLAKE2b hardfork rules, demoting each to an additional connection. Only
+        // the persistent outbound target types are gated; ADDR_FETCH (eg
+        // -seednode) and FEELER are transient and count towards no target, so
+        // spending the budget on them would only break bootstrapping.
+        if ((pfrom.IsFullOutboundConn() || pfrom.IsBlockOnlyConn()) && !(nServices & NODE_BLAKE2B)) {
+            // Keep it as an additional connection, see CNode::m_is_stale_outbound.
+            if (!m_connman.DemoteToStaleOutbound(pfrom, m_opts.maxstaleoutbound)) {
                 return;
             }
-            ++m_num_non_bip110_outbound;
-            pfrom.m_is_non_bip110_outbound = true;
-            LogDebug(BCLog::NET, "connected to non-BIP110 outbound peer (%u/%u), %s\n",
-                     m_num_non_bip110_outbound.load(),
-                     m_opts.maxstaleoutbound,
-                     pfrom.ConnectionTypeAsString());
         }
         peer->m_their_services = nServices;
         pfrom.SetAddrLocal(addrMe);
@@ -4034,7 +4088,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
             // our initial peer is unresponsive (but less bandwidth than we'd
             // use if we turned on sync with all peers).
             CNodeState& state{*Assert(State(pfrom.GetId()))};
-            if (state.fSyncStarted || (!peer->m_inv_triggered_getheaders_before_sync && *best_block != m_last_block_inv_triggering_headers_sync)) {
+            if (CanSyncHeadersFrom(*peer) && (state.fSyncStarted || (!peer->m_inv_triggered_getheaders_before_sync && *best_block != m_last_block_inv_triggering_headers_sync))) {
                 if (MaybeSendGetHeaders(pfrom, GetLocator(m_chainman.m_best_header), *peer)) {
                     LogDebug(BCLog::NET, "getheaders (%d) %s to peer=%d\n",
                             m_chainman.m_best_header->nHeight, best_block->ToString(),
@@ -4116,8 +4170,9 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         if (pindex)
             pindex = m_chainman.ActiveChain().Next(pindex);
         int nLimit = 500;
+        const int block_sharing_height_limit{PeerBlockSharingHeightLimit(*peer)};
         LogDebug(BCLog::NET, "getblocks %d to %s limit %d from peer=%d\n", (pindex ? pindex->nHeight : -1), hashStop.IsNull() ? "end" : hashStop.ToString(), nLimit, pfrom.GetId());
-        for (; pindex; pindex = m_chainman.ActiveChain().Next(pindex))
+        for (; pindex && pindex->nHeight <= block_sharing_height_limit; pindex = m_chainman.ActiveChain().Next(pindex))
         {
             if (pindex->GetBlockHash() == hashStop)
             {
@@ -4259,8 +4314,9 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         // we must use CBlocks, as CBlockHeaders won't include the 0x00 nTx count at the end
         std::vector<CBlock> vHeaders;
         int nLimit = m_opts.max_headers_result;
+        const int block_sharing_height_limit{PeerBlockSharingHeightLimit(*peer)};
         LogDebug(BCLog::NET, "getheaders %d to %s from peer=%d\n", (pindex ? pindex->nHeight : -1), hashStop.IsNull() ? "end" : hashStop.ToString(), pfrom.GetId());
-        for (; pindex; pindex = m_chainman.ActiveChain().Next(pindex))
+        for (; pindex && pindex->nHeight <= block_sharing_height_limit; pindex = m_chainman.ActiveChain().Next(pindex))
         {
             vHeaders.emplace_back(pindex->GetBlockHeader());
             if (--nLimit <= 0 || pindex->GetBlockHash() == hashStop)
@@ -4270,6 +4326,8 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         // if our peer has m_chainman.ActiveChain().Tip() (and thus we are sending an empty
         // headers message). In both cases it's safe to update
         // pindexBestHeaderSent to be our tip.
+        // For stale peers, pindex can instead be the first header after the
+        // common block, so record the preceding header as the last one sent.
         //
         // It is important that we simply reset the BestHeaderSent value here,
         // and not max(BestHeaderSent, newHeaderSent). We might have announced
@@ -4278,7 +4336,11 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         // without the new block. By resetting the BestHeaderSent, we ensure we
         // will re-announce the new block via headers (or compact blocks again)
         // in the SendMessages logic.
-        nodestate->pindexBestHeaderSent = pindex ? pindex : m_chainman.ActiveChain().Tip();
+        if (pindex && pindex->nHeight > block_sharing_height_limit) {
+            nodestate->pindexBestHeaderSent = pindex->pprev;
+        } else {
+            nodestate->pindexBestHeaderSent = pindex ? pindex : m_chainman.ActiveChain().Tip();
+        }
         MakeAndPushMessage(pfrom, NetMsgType::HEADERS, TX_WITH_WITNESS(vHeaders));
         return;
     }
@@ -5158,7 +5220,9 @@ void PeerManagerImpl::EvictExtraOutboundPeers(std::chrono::seconds now)
         std::pair<NodeId, std::chrono::seconds> youngest_peer{-1, 0}, next_youngest_peer{-1, 0};
 
         m_connman.ForEachNode([&](CNode* pnode) {
-            if (!pnode->IsBlockOnlyConn() || pnode->fDisconnect) return;
+            // A stale peer is not what put us over the target, so evicting one
+            // would leave us over it.
+            if (!pnode->IsBlockOnlyConn() || pnode->fDisconnect || !pnode->CountsTowardOutboundTarget()) return;
             if (pnode->GetId() > youngest_peer.first) {
                 next_youngest_peer = youngest_peer;
                 youngest_peer.first = pnode->GetId();
@@ -5208,8 +5272,9 @@ void PeerManagerImpl::EvictExtraOutboundPeers(std::chrono::seconds now)
             AssertLockHeld(::cs_main);
 
             // Only consider outbound-full-relay peers that are not already
-            // marked for disconnection
-            if (!pnode->IsFullOutboundConn() || pnode->fDisconnect) return;
+            // marked for disconnection, and that count towards the target we are
+            // over: evicting a stale peer would leave us over it.
+            if (!pnode->IsFullOutboundConn() || pnode->fDisconnect || !pnode->CountsTowardOutboundTarget()) return;
             CNodeState *state = State(pnode->GetId());
             if (state == nullptr) return; // shouldn't be possible, but just in case
             // Don't evict our protected peers
@@ -5548,6 +5613,18 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
             m_chainman.m_best_header = m_chainman.ActiveChain().Tip();
         }
 
+        if (state.pindexBestKnownBlock == nullptr && !CanServeHeaders(*peer) && CanServeBlocks(*peer) && !pto->IsAddrFetchConn() && !peer->m_stale_peer_probe_sent && m_chainparams.StalePeerCommonHeight() != std::numeric_limits<int>::max() && m_chainman.m_best_header->nHeight >= m_chainparams.StalePeerCommonHeight()) {
+            const int starting_height{peer->m_starting_height.load()};
+            const int common_height{m_chainparams.StalePeerCommonHeight()};
+            const int probe_height{starting_height < 0 ? common_height : std::min(starting_height, common_height)};
+            const CBlockIndex* probe_header{Assert(m_chainman.m_best_header->GetAncestor(probe_height))};
+            if (MaybeSendGetHeaders(*pto, CBlockLocator{}, *peer, probe_header->GetBlockHash())) {
+                peer->m_stale_peer_probe_sent = true;
+                LogDebug(BCLog::NET, "requesting common header %s at height=%d from peer=%d\n",
+                         probe_header->GetBlockHash().ToString(), probe_height, pto->GetId());
+            }
+        }
+
         // Determine whether we might try initial headers sync or parallel
         // block download from this peer -- this mostly affects behavior while
         // in IBD (once out of IBD, we sync from all peers).
@@ -5610,6 +5687,14 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
             // blocks, or if the peer doesn't want headers, just
             // add all to the inv queue.
             LOCK(peer->m_block_inv_mutex);
+            const int block_sharing_height_limit{PeerBlockSharingHeightLimit(*peer)};
+            if (block_sharing_height_limit != std::numeric_limits<int>::max()) {
+                std::erase_if(peer->m_blocks_for_headers_relay, [&](const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
+                    const CBlockIndex* pindex = m_chainman.m_blockman.LookupBlockIndex(hash);
+                    assert(pindex);
+                    return pindex->nHeight > block_sharing_height_limit;
+                });
+            }
             std::vector<CBlock> vHeaders;
             bool fRevertToInv = ((!peer->m_prefers_headers &&
                                  (!state.m_requested_hb_cmpctblocks || peer->m_blocks_for_headers_relay.size() > 1)) ||

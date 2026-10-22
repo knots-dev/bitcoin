@@ -24,17 +24,6 @@
 #include <utility>
 #include <vector>
 
-enum class RDTSConsentFlag {
-    RUNTIME_CHECK,
-    IMPLICIT,
-    RUNTIME_WARN,
-    UNSUPPORTED_UNSAFE_NO_ENFORCEMENT,
-};
-
-extern RDTSConsentFlag g_rdts_consent;
-extern bool g_enable_rdts;
-extern bool g_rdts_warning;
-
 typedef std::map<int, uint256> MapCheckpoints;
 
 struct CCheckpointData {
@@ -132,6 +121,8 @@ public:
     ChainType GetChainType() const { return m_chain_type; }
     /** Return the list of hostnames to look up for DNS seeds */
     const std::vector<std::string>& DNSSeeds() const { return vSeeds; }
+    /** Highest block height used for stale-peer block exchange. */
+    int StalePeerCommonHeight() const { return m_stale_peer_common_height; }
     const std::vector<unsigned char>& Base58Prefix(Base58Type type) const { return base58Prefixes[type]; }
     const std::string& Bech32HRP() const { return bech32_hrp; }
     const std::vector<uint8_t>& FixedSeeds() const { return vFixedSeeds; }
@@ -177,6 +168,16 @@ public:
         std::unordered_map<Consensus::BuriedDeployment, int> activation_heights{};
         bool fastprune{false};
         bool enforce_bip94{false};
+        std::optional<int> stale_peer_common_height{};
+        //! If set, RDTS rules apply to blocks from the blake2b activation
+        //! height until the parent block's median-time-past reaches this
+        //! value (see -rdtsexpiry). Requires a blake2b activation height.
+        std::optional<int64_t> rdts_expiry_time{};
+        std::optional<std::vector<unsigned char>> blake2b_headline{};
+        std::optional<int> coinbase_maturity_long_start_height{};
+        std::optional<int> coinbase_maturity_long_enforce_height{};
+        std::optional<int> coinbase_maturity_long_release_height{};
+        std::optional<int64_t> coinbase_maturity_long_expiry{};
     };
 
     static std::unique_ptr<const CChainParams> RegTest(const RegTestOptions& options);
@@ -202,6 +203,7 @@ protected:
     std::vector<uint8_t> vFixedSeeds;
     bool fDefaultConsistencyChecks;
     bool m_is_mockable_chain;
+    int m_stale_peer_common_height{std::numeric_limits<int>::max()};
     CCheckpointData checkpointData;
     std::vector<AssumeutxoData> m_assumeutxo_data;
     ChainTxData chainTxData;

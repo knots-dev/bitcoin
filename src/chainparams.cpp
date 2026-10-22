@@ -7,9 +7,9 @@
 
 #include <chainparamsbase.h>
 #include <common/args.h>
+#include <consensus/consensus.h>
 #include <consensus/params.h>
 #include <deploymentinfo.h>
-#include <kernel/chainparams.h>
 #include <logging.h>
 #include <tinyformat.h>
 #include <util/chaintype.h>
@@ -76,6 +76,81 @@ void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& opti
         }
     }
 
+    if (const auto arg{args.GetArg("-stalepeercommonheight")}; arg) {
+        const auto activation{options.activation_heights.find(Consensus::BuriedDeployment::DEPLOYMENT_BLAKE2B)};
+        if (activation == options.activation_heights.end()) {
+            throw std::runtime_error("-stalepeercommonheight requires -testactivationheight=blake2b@<height>");
+        }
+        int32_t height;
+        if (!ParseInt32(*arg, &height) || height < 0 || height >= activation->second) {
+            throw std::runtime_error(strprintf("Invalid height (%s) for -stalepeercommonheight: must be below the BLAKE2b activation height (%d).", *arg, activation->second));
+        }
+        options.stale_peer_common_height = height;
+    }
+
+    if (const auto arg{args.GetArg("-rdtsexpiry", "")}; !arg.empty()) {
+        // RDTS activates at the BLAKE2b fork height: one fork instant, as on
+        // mainnet. Only the deployment's expiry is schedulable here; a
+        // separate activation would let tests schedule the two apart, which
+        // no real network can do.
+        if (!options.activation_heights.contains(Consensus::BuriedDeployment::DEPLOYMENT_BLAKE2B)) {
+            throw std::runtime_error("-rdtsexpiry requires -testactivationheight=blake2b@<height> (RDTS activates at the hardfork).");
+        }
+        int64_t expiry;
+        // Must postdate the regtest genesis block (1296688602): an earlier
+        // expiry precedes every possible median-time-past, making it
+        // indistinguishable from not scheduling the deployment at all.
+        if (!ParseInt64(arg, &expiry) || expiry <= 1296688602) {
+            throw std::runtime_error(strprintf("Invalid expiry (%s) for -rdtsexpiry=<time>: must exceed the regtest genesis timestamp (1296688602).", arg));
+        }
+        options.rdts_expiry_time = expiry;
+    }
+
+    if (const auto arg{args.GetArg("-blake2b_headline")}; arg) {
+        if (!options.activation_heights.contains(Consensus::BuriedDeployment::DEPLOYMENT_BLAKE2B)) {
+            throw std::runtime_error("-blake2b_headline requires -testactivationheight=blake2b@<height>");
+        }
+        options.blake2b_headline.emplace(arg->begin(), arg->end());
+    }
+
+    if (const auto arg{args.GetArg("-testcoinbasematuritylong")}; arg) {
+        const auto values{SplitString(*arg, ':')};
+        if (values.size() != 3) {
+            throw std::runtime_error(strprintf("Invalid format (%s) for -testcoinbasematuritylong=<start_height>:<enforce_height>:<release_height>.", *arg));
+        }
+
+        int32_t start_height;
+        int32_t enforce_height;
+        int32_t release_height;
+        if (!ParseInt32(values[0], &start_height) || start_height < 0 || start_height >= std::numeric_limits<int>::max()) {
+            throw std::runtime_error(strprintf("Invalid start height (%s) for -testcoinbasematuritylong=<start_height>:<enforce_height>:<release_height>.", values[0]));
+        }
+        if (!ParseInt32(values[1], &enforce_height) || enforce_height < 2 || enforce_height >= std::numeric_limits<int>::max()) {
+            throw std::runtime_error(strprintf("Invalid enforce height (%s) for -testcoinbasematuritylong=<start_height>:<enforce_height>:<release_height>.", values[1]));
+        }
+        if (!ParseInt32(values[2], &release_height) || release_height <= start_height || release_height <= enforce_height || release_height >= std::numeric_limits<int>::max()) {
+            throw std::runtime_error(strprintf("Invalid release height (%s) for -testcoinbasematuritylong=<start_height>:<enforce_height>:<release_height>.", values[2]));
+        }
+        if (release_height - start_height <= COINBASE_MATURITY) {
+            throw std::runtime_error(strprintf("Invalid height range (%s) for -testcoinbasematuritylong=<start_height>:<enforce_height>:<release_height>: release_height - start_height must exceed COINBASE_MATURITY.", *arg));
+        }
+
+        options.coinbase_maturity_long_start_height = start_height;
+        options.coinbase_maturity_long_enforce_height = enforce_height;
+        options.coinbase_maturity_long_release_height = release_height;
+    }
+
+    if (const auto arg{args.GetArg("-testcoinbasematuritylongexpiry")}; arg) {
+        int64_t expiry;
+        if (!options.coinbase_maturity_long_start_height || !ParseInt64(*arg, &expiry) || expiry <= 1296688602) {
+            throw std::runtime_error("Invalid long coinbase maturity expiry: requires -testcoinbasematuritylong and a time after regtest genesis.");
+        }
+        if (options.rdts_expiry_time && *options.rdts_expiry_time != expiry) {
+            throw std::runtime_error("Long coinbase maturity expiry must match RDTS expiry.");
+        }
+        options.coinbase_maturity_long_expiry = expiry;
+    }
+
     for (const std::string& strDeployment : args.GetArgs("-vbparams")) {
         std::vector<std::string> vDeploymentParams = SplitString(strDeployment, ':');
         if (vDeploymentParams.size() < 3 || 7 < vDeploymentParams.size()) {
@@ -138,17 +213,6 @@ const CChainParams &Params() {
 
 std::unique_ptr<const CChainParams> CreateChainParams(const ArgsManager& args, const ChainType chain)
 {
-    g_rdts_consent = static_cast<RDTSConsentFlag>(args.GetIntArg("rdts_consent_flag", static_cast<int64_t>(g_rdts_consent)));
-    g_enable_rdts = g_rdts_consent != RDTSConsentFlag::UNSUPPORTED_UNSAFE_NO_ENFORCEMENT;
-    if (g_rdts_consent == RDTSConsentFlag::UNSUPPORTED_UNSAFE_NO_ENFORCEMENT && !g_enable_rdts) {
-        for (const auto& rulesok : args.GetArgs(CONSENSUSRULES_CONFIG_NAME)) {
-            if (rulesok == CONSENSUSRULES_REQUIRED) {
-                g_enable_rdts = true;
-                break;
-            }
-        }
-    }
-
     switch (chain) {
     case ChainType::MAIN:
         return CChainParams::Main();

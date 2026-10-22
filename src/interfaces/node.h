@@ -185,6 +185,9 @@ public:
     //! Get last block time.
     virtual int64_t getLastBlockTime() = 0;
 
+    //! Get policy maturity for a coinbase height; unknown heights use the long depth.
+    virtual int coinbaseMaturity(int coin_height = -1) = 0;
+
     //! Get verification progress.
     virtual double getVerificationProgress() = 0;
 
