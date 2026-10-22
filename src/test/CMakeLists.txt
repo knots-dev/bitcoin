@@ -20,6 +20,7 @@ add_executable(test_bitcoin
   bip324_tests.cpp
   blockchain_tests.cpp
   blockencodings_tests.cpp
+  block_header_tests.cpp
   blockfilter_index_tests.cpp
   blockfilter_tests.cpp
   blockmanager_tests.cpp
@@ -29,6 +30,7 @@ add_executable(test_bitcoin
   chainstate_write_tests.cpp
   checkqueue_tests.cpp
   cluster_linearize_tests.cpp
+  coinbase_maturity_tests.cpp
   codex32_tests.cpp
   coins_tests.cpp
   coinscachepair_tests.cpp
@@ -79,6 +81,7 @@ add_executable(test_bitcoin
   raii_event_tests.cpp
   random_tests.cpp
   rbf_tests.cpp
+  rdts_params_tests.cpp
   rest_tests.cpp
   result_tests.cpp
   reverselock_tests.cpp
@@ -133,10 +136,12 @@ include(TargetDataSources)
 target_json_data_sources(test_bitcoin
   data/base58_encode_decode.json
   data/bip341_wallet_vectors.json
+  data/block_header_v2.json
   data/blockfilters.json
   data/key_io_invalid.json
   data/key_io_valid.json
   data/script_tests.json
+  data/unified_sighash.json
   data/sighash.json
   data/tx_invalid.json
   data/tx_valid.json

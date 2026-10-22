@@ -3,8 +3,6 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <bitcoin-build-config.h> // IWYU pragma: keep
-
 #include <kernel/chainparams.h>
 
 #include <chainparamsseeds.h>
@@ -29,10 +27,6 @@
 #include <type_traits>
 
 using namespace util::hex_literals;
-
-RDTSConsentFlag g_rdts_consent{RDTS_CONSENT};
-bool g_enable_rdts{g_rdts_consent != RDTSConsentFlag::UNSUPPORTED_UNSAFE_NO_ENFORCEMENT};
-bool g_rdts_warning{false};
 
 // Workaround MSVC bug triggering C7595 when calling consteval constructors in
 // initializer lists.
@@ -83,6 +77,15 @@ static CBlock CreateGenesisBlock(uint32_t nTime, uint32_t nNonce, uint32_t nBits
     return CreateGenesisBlock(pszTimestamp, genesisOutputScript, nTime, nNonce, nBits, nVersion, genesisReward);
 }
 
+static void AddLongCoinbaseMaturityRevalidationDeployment(Consensus::Params& consensus)
+{
+    consensus.chainstate_revalidation_deployments.push_back({
+        .name = consensus.CoinbaseMaturityLongUntilRdts ? "rolling_coinbase_maturity_180d_v2" : "long_coinbase_maturity",
+        .start_height = consensus.CoinbaseMaturityLongEnforceHeight,
+        .stop_height = consensus.CoinbaseMaturityLongUntilRdts ? std::numeric_limits<int>::max() : consensus.CoinbaseMaturityLongReleaseHeight - 1,
+    });
+}
+
 /**
  * Main network on which people trade goods and services.
  */
@@ -123,25 +126,43 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nTimeout = 1628640000; // August 11th, 2021
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].min_activation_height = 709632; // Approximately November 12th, 2021
 
-        // ReducedData Temporary Softfork (RDTS)
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].bit = 4;
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].nStartTime = 1764547200; // December 1st, 2025
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].min_activation_height = 0;
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].max_activation_height = 965664; // ~September 1st, 2026
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].active_duration = 52416; // ~1 year
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].threshold = 1109; // 55% of 2016
-
-        if (g_rdts_consent == RDTSConsentFlag::UNSUPPORTED_UNSAFE_NO_ENFORCEMENT && !g_enable_rdts) {
-            consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
-            consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
-            consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].max_activation_height = std::numeric_limits<int>::max();
-            consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].active_duration = std::numeric_limits<int>::max();
-            consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].threshold = 0;
+        consensus.Blake2bHeight = 961640;
+        {
+            constexpr std::string_view headline = "8-30 NYPost Deride And Conquer";
+            consensus.Blake2bHeadline.assign(headline.begin(), headline.end());
         }
+        consensus.Blake2bTargetShift = 22;
 
-        consensus.nMinimumChainWork = uint256{"0000000000000000000000000000000000000000dee8e2a309ad8a9820433c68"};
-        consensus.defaultAssumeValid = uint256{"00000000000000000000611fd22f2df7c8fbd0688745c3a6c3bb5109cc2a12cb"}; // 912683
+        // RDTS: its rules apply to every block from Blake2bHeight (the
+        // flag-day activation, set at release cut) until the parent block's
+        // median-time-past reaches RdtsExpiryTime. (RDTS previously activated
+        // via versionbits; the stall at 961633 prevented it from ever
+        // reaching ACTIVE, and that deployment has been removed.)
+        consensus.RdtsExpiryTime = 1819756800; // September 1st, 2027 00:00 UTC
+
+        // Keep the historical 6480 rule so the existing long_coinbase_maturity
+        // marker continues to cover 973440–979919. Pruned nodes that lack the
+        // earlier block/undo data can still start.
+        consensus.CoinbaseMaturityHistoricalStartHeight = 973440;
+        consensus.CoinbaseMaturityHistoricalReleaseHeight = 979920;
+        // 180-day rolling rule covers coins created from the original #419 window.
+        consensus.CoinbaseMaturityLongStartHeight = 973440;
+        consensus.CoinbaseMaturityLongEnforceHeight = 973440;
+        // Each covered reward matures independently after approximately 180 days.
+        // Expiry only ends coverage of newly mined rewards; it never releases old ones.
+        consensus.CoinbaseMaturityLongUntilRdts = true;
+        consensus.CoinbaseMaturityLong = 180 * 144;
+        // Revalidation starts at 979920 (not 973440) so pruned nodes do not fail.
+        // Rename the marker so a previous v2 marker cannot certify this schedule.
+        consensus.chainstate_revalidation_deployments.push_back({
+            .name = "rolling_coinbase_maturity_180d_v3",
+            .start_height = 979920,
+            .stop_height = std::numeric_limits<int>::max(),
+        });
+
+
+        consensus.nMinimumChainWork = uint256{"00000000000000000000000000000000000000013e00277374c9f9eeadc70200"};
+        consensus.defaultAssumeValid = uint256{"0000000000000078ed1e20cac1acf78df6d1060c78059fb6331e17141c881fc8"}; // 964264
 
         /**
          * The message start string is designed to be unlikely to occur in normal data.
@@ -169,8 +190,8 @@ public:
         // release ASAP to avoid it where possible.
         vSeeds.emplace_back("seed.bitcoin.sipa.be."); // Pieter Wuille, only supports x1, x5, x9, and xd
         vSeeds.emplace_back("dnsseed.bluematt.me."); // Matt Corallo, only supports x9
-        vSeeds.emplace_back("dnsseed.bitcoin.dashjr-list-of-p2p-nodes.us."); // Luke Dashjr, support BIP110 seeding (x8000009)
-        vSeeds.emplace_back("seed.bitcoin.haf.ovh."); // Léo Haf, support BIP110 seeding (x8000009)
+        vSeeds.emplace_back("dnsseed.bitcoin.dashjr-list-of-p2p-nodes.us."); // Luke Dashjr, support hardfork seeding (x10000009)
+        vSeeds.emplace_back("seed.bitcoin.haf.ovh."); // Léo Haf, support hardfork seeding (x10000009)
         vSeeds.emplace_back("seed.bitcoin.jonasschnelli.ch."); // Jonas Schnelli, only supports x1, x5, x9, and xd
         vSeeds.emplace_back("seed.bitcoin.sprovoost.nl."); // Sjors Provoost
         vSeeds.emplace_back("dnsseed.emzy.de."); // Stephan Oeste
@@ -231,6 +252,9 @@ public:
                 {855000, uint256{"0000000000000000000233ea80aa10d38aa4486cd7033fffc2c4df556d0b9138"}},
                 {885248, uint256{"000000000000000000006e926737e6a349f7581525ad36e743dfe5f4bc3abbb7"}},
                 {908765, uint256{"00000000000000000001b64acb5fe4b40b84092159b6406a6244f46a37fa6c6b"}},
+                {961632, uint256{"0000000000000000000169eb6f811ddbd0daf343af7b62180cdb13e7c78dbc16"}},  // first BIP110 block
+                {961639, uint256{"00000000000000000001bbc439e13f749dca850d32c7a2834165338713027e65"}},  // last SHA256d block
+                {961640, uint256{"0000000000000050c1e5f69672f459293be14f46e5a494e7a8c8541396f18eeb"}},  // first BLAKE2b block
             }
         };
 
@@ -282,7 +306,14 @@ public:
         consensus.BIP66Height = 330776; // 000000002104c8c45e99a8853285a3b592602a3ccde2b832481da85e9e4ba182
         consensus.CSVHeight = 770112; // 00000000025e930139bac5c6c31a403776da130831ab85be56578f3fa75369bb
         consensus.SegwitHeight = 834624; // 00000000002b980fcd729daaa248fd9316a5200e9b367f4ff2c42453e84201ca
-        consensus.MinBIP9WarningHeight = 836640; // segwit activation height + miner confirmation window
+        // The versionbits RDTS deployment (bit 4) that shipped in Knots 29.3
+        // and 29.4 locked in on testnet3 at height 4961376 (1975 of 2016
+        // blocks signalled in the preceding window) and was enforced for
+        // heights 4963392 to 5015807. It is no longer a known deployment, so
+        // that signalling would otherwise latch the "unknown new rules
+        // activated" warning forever; skip that era (window boundary after the
+        // last window exceeding the warning threshold).
+        consensus.MinBIP9WarningHeight = 4967424;
         consensus.powLimit = uint256{"00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // two weeks
         consensus.nPowTargetSpacing = 10 * 60;
@@ -301,14 +332,6 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nStartTime = 1619222400; // April 24th, 2021
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nTimeout = 1628640000; // August 11th, 2021
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].min_activation_height = 0; // No activation delay
-
-        // ReducedData Temporary Softfork (RDTS)
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].bit = 4;
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].nStartTime = 1764547200; // December 1st, 2025
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].min_activation_height = 0;
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].active_duration = 52416; // ~1 year
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].threshold = 1109; // 55% of 2016
 
         consensus.nMinimumChainWork = uint256{"0000000000000000000000000000000000000000000015f5e0c9f13455b0eb17"};
         consensus.defaultAssumeValid = uint256{"00000000000003fc7967410ba2d0a8a8d50daedc318d43e8baf1a9782c236a57"}; // 3974606
@@ -408,13 +431,14 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].min_activation_height = 0; // No activation delay
 
-        // ReducedData Temporary Softfork (RDTS)
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].bit = 4;
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].nStartTime = 1764547200; // December 1st, 2025
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].min_activation_height = 0;
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].active_duration = 52416; // ~1 year
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].threshold = 1109; // 55% of 2016
+        consensus.Blake2bHeight = 150308;
+        consensus.RdtsExpiryTime = 1791903600; // October 13th, 2026 15:00:00 UTC
+
+        consensus.CoinbaseMaturityLongStartHeight = 151406;
+        consensus.CoinbaseMaturityLongEnforceHeight = 151550;
+        consensus.CoinbaseMaturityLongReleaseHeight = 158111;
+        consensus.CoinbaseMaturityLong = consensus.CoinbaseMaturityLongReleaseHeight - consensus.CoinbaseMaturityLongStartHeight;
+        AddLongCoinbaseMaturityRevalidationDeployment(consensus);
 
         consensus.nMinimumChainWork = uint256{"0000000000000000000000000000000000000000000001d6dce8651b6094e4c1"};
         consensus.defaultAssumeValid = uint256{"0000000000003ed4f08dbdf6f7d6b271a6bcffce25675cb40aa9fa43179a89f3"}; // 72600
@@ -446,6 +470,7 @@ public:
         // nodes with support for servicebits filtering should be at the top
         vSeeds.emplace_back("seed.testnet4.bitcoin.sprovoost.nl."); // Sjors Provoost
         vSeeds.emplace_back("seed.testnet4.wiz.biz."); // Jason Maurice
+        vSeeds.emplace_back("seed.testnet-bitcoin.haf.ovh."); // Léo Haf, support x10000009
 
         base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,111);
         base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,196);
@@ -554,11 +579,6 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].min_activation_height = 0; // No activation delay
 
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].bit = 4;
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].min_activation_height = 0;
-
         // message start is defined as the first 4 bytes of the sha256d of the block script
         HashWriter h{};
         h << consensus.signet_challenge;
@@ -634,11 +654,6 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].min_activation_height = 0; // No activation delay
 
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].bit = 4;
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
-        consensus.vDeployments[Consensus::DEPLOYMENT_REDUCED_DATA].min_activation_height = 0;
-
         consensus.nMinimumChainWork = uint256{};
         consensus.defaultAssumeValid = uint256{};
 
@@ -653,6 +668,9 @@ public:
 
         for (const auto& [dep, height] : opts.activation_heights) {
             switch (dep) {
+            case Consensus::BuriedDeployment::DEPLOYMENT_BLAKE2B:
+                consensus.Blake2bHeight = int{height};
+                break;
             case Consensus::BuriedDeployment::DEPLOYMENT_SEGWIT:
                 consensus.SegwitHeight = int{height};
                 break;
@@ -669,6 +687,30 @@ public:
                 consensus.CSVHeight = int{height};
                 break;
             }
+        }
+
+        if (opts.blake2b_headline) {
+            consensus.Blake2bHeadline = *opts.blake2b_headline;
+        }
+
+        // Optionally schedule the RDTS deployment (see -rdtsexpiry). RDTS
+        // activates at the BLAKE2b fork height scheduled above; only the
+        // expiry is separately settable, as on mainnet. Left unscheduled by
+        // default, so regtest behaviour is unchanged.
+        if (opts.rdts_expiry_time) {
+            consensus.RdtsExpiryTime = *opts.rdts_expiry_time;
+        }
+
+        if (opts.coinbase_maturity_long_start_height) {
+            consensus.CoinbaseMaturityLongStartHeight = *opts.coinbase_maturity_long_start_height;
+            consensus.CoinbaseMaturityLongEnforceHeight = *opts.coinbase_maturity_long_enforce_height;
+            consensus.CoinbaseMaturityLongReleaseHeight = *opts.coinbase_maturity_long_release_height;
+            consensus.CoinbaseMaturityLong = consensus.CoinbaseMaturityLongReleaseHeight - consensus.CoinbaseMaturityLongStartHeight;
+            if (opts.coinbase_maturity_long_expiry) {
+                consensus.CoinbaseMaturityLongUntilRdts = true;
+                consensus.RdtsExpiryTime = *opts.coinbase_maturity_long_expiry;
+            }
+            AddLongCoinbaseMaturityRevalidationDeployment(consensus);
         }
 
         for (const auto& [deployment_pos, version_bits_params] : opts.version_bits_parameters) {

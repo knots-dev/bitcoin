@@ -9,6 +9,7 @@
 
 #include <blockfilter.h>
 #include <chain.h>
+#include <common/sighash_rules.h>
 #include <chainparams.h>
 #include <chainparamsbase.h>
 #include <clientversion.h>
@@ -131,6 +132,20 @@ double GetDifficulty(const CBlockIndex& blockindex)
     return dDiff;
 }
 
+double GetDifficultyBlake2b(const CBlockIndex& blockindex)
+{
+    return GetBlockProof(blockindex).getdouble();
+}
+
+void PushDifficulty(UniValue& result, const CBlockIndex& blockindex)
+{
+    if (blockindex.m_header_v2) {
+        result.pushKV("difficulty_blake2b", GetDifficultyBlake2b(blockindex));
+    } else {
+        result.pushKV("difficulty", GetDifficulty(blockindex));
+    }
+}
+
 static int ComputeNextBlockAndDepth(const CBlockIndex& tip, const CBlockIndex& blockindex, const CBlockIndex*& next)
 {
     next = tip.GetAncestor(blockindex.nHeight + 1);
@@ -169,6 +184,15 @@ static const CBlockIndex* ParseHashOrHeight(const UniValue& param, ChainstateMan
     }
 }
 
+//! Hex-encode a 32-bit header field in wire byte order, ie the same bytes in
+//! the same order as they appear in the serialised header.
+static std::string HeaderFieldHex(const uint32_t field)
+{
+    DataStream ss{};
+    ss << field;
+    return HexStr(ss);
+}
+
 UniValue blockheaderToJSON(const CBlockIndex& tip, const CBlockIndex& blockindex, const uint256 pow_limit)
 {
     // Serialize passed information without accessing chain state of the active chain!
@@ -188,9 +212,27 @@ UniValue blockheaderToJSON(const CBlockIndex& tip, const CBlockIndex& blockindex
     result.pushKV("nonce", blockindex.nNonce);
     result.pushKV("bits", strprintf("%08x", blockindex.nBits));
     result.pushKV("target", GetTarget(blockindex, pow_limit).GetHex());
-    result.pushKV("difficulty", GetDifficulty(blockindex));
+    PushDifficulty(result, blockindex);
     result.pushKV("chainwork", blockindex.nChainWork.GetHex());
     result.pushKV("nTx", blockindex.nTx);
+    if (blockindex.nTx > 0) {
+        result.pushKV("txcount", blockindex.nTx);
+    } else if (blockindex.m_header_v2) {
+        // The block itself hasn't been seen yet, but a v2 header commits to
+        // the number of transactions in it.
+        result.pushKV("txcount", (uint64_t)blockindex.m_txcount);
+    }
+    result.pushKV("header_version", blockindex.m_header_v2 ? 2 : 0);
+    if (blockindex.m_header_v2) {
+        result.pushKV("nonce2", HeaderFieldHex(blockindex.m_nonce2));
+        result.pushKV("nonce3", HeaderFieldHex(blockindex.m_nonce3));
+        result.pushKV("extranonce", HexStr(blockindex.m_extranonce));
+        result.pushKV("time_offset", (uint64_t)blockindex.m_time_offset);
+        result.pushKV("header_flags", blockindex.m_flags);
+        result.pushKV("xor_key_mask_clear_bits", blockindex.m_xor_key_mask_clear_bits);
+        result.pushKV("xor_key", HexStr(blockindex.m_xor_key));
+        result.pushKV("mm_rhs", HexStr(blockindex.m_mm_rhs));
+    }
 
     if (blockindex.pprev)
         result.pushKV("previousblockhash", blockindex.pprev->GetBlockHash().GetHex());
@@ -476,26 +518,6 @@ static RPCHelpMan syncwithvalidationinterfacequeue()
     };
 }
 
-static RPCHelpMan getdifficulty()
-{
-    return RPCHelpMan{"getdifficulty",
-                "\nReturns the proof-of-work difficulty as a multiple of the minimum difficulty.\n",
-                {},
-                RPCResult{
-                    RPCResult::Type::NUM, "", "the proof-of-work difficulty as a multiple of the minimum difficulty."},
-                RPCExamples{
-                    HelpExampleCli("getdifficulty", "")
-            + HelpExampleRpc("getdifficulty", "")
-                },
-        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
-{
-    ChainstateManager& chainman = EnsureAnyChainman(request.context);
-    LOCK(cs_main);
-    return GetDifficulty(*CHECK_NONFATAL(chainman.ActiveChain().Tip()));
-},
-    };
-}
-
 static RPCHelpMan getblockfrompeer()
 {
     return RPCHelpMan{
@@ -736,6 +758,9 @@ static RPCHelpMan sweepprivkeys()
             const auto& utxo = input_txos[input_index];
             SignatureData sig_data;
             MutableTransactionSignatureCreator creator(tx, input_index, utxo.nValue, &txdata, SIGHASH_ALL);
+            // A swept key is the case replay protection matters most for: it is
+            // the one most likely already known to someone else.
+            creator.SetSighashRules(SighashRulesForSigning());
             if (!ProduceSignature(temp_keystore, creator, utxo.scriptPubKey, sig_data)) {
                 throw JSONRPCError(RPC_MISC_ERROR, "Failed to sign");
             }
@@ -791,9 +816,20 @@ static RPCHelpMan getblockheader()
                             {RPCResult::Type::NUM, "nonce", "The nonce"},
                             {RPCResult::Type::STR_HEX, "bits", "nBits: compact representation of the block difficulty target"},
                             {RPCResult::Type::STR_HEX, "target", "The difficulty target"},
-                            {RPCResult::Type::NUM, "difficulty", "The difficulty"},
+                            {RPCResult::Type::NUM, "difficulty", /*optional=*/true, "The proof-of-work difficulty as a multiple of the minimum difficulty (only for SHA256d blocks)"},
+                            {RPCResult::Type::NUM, "difficulty_blake2b", /*optional=*/true, "The expected average number of BLAKE2b hashes needed to find this block (only for header-v2 blocks)"},
                             {RPCResult::Type::STR_HEX, "chainwork", "Expected number of hashes required to produce the current chain"},
-                            {RPCResult::Type::NUM, "nTx", "The number of transactions in the block"},
+                            {RPCResult::Type::NUM, "nTx", "The number of transactions in the block, or 0 if only the block header is available (DEPRECATED)"},
+                            {RPCResult::Type::NUM, "txcount", /*optional=*/true, "The number of transactions in the block; for entries where only the header has been seen this is the count committed in the v2 header, and it is omitted when unknown"},
+                            {RPCResult::Type::NUM, "header_version", "2 for a BLAKE2b v2 header, 0 otherwise"},
+                            {RPCResult::Type::STR_HEX, "nonce2", /*optional=*/true, "The second nonce, in wire byte order (only present for v2 headers)"},
+                            {RPCResult::Type::STR_HEX, "nonce3", /*optional=*/true, "The third nonce, in wire byte order (only present for v2 headers)"},
+                            {RPCResult::Type::STR_HEX, "extranonce", /*optional=*/true, "The 128-bit extranonce (only present for v2 headers)"},
+                            {RPCResult::Type::NUM, "time_offset", /*optional=*/true, "The offset subtracted from the block time on the wire, per header flags bit 2 (only present for v2 headers)"},
+                            {RPCResult::Type::NUM, "header_flags", /*optional=*/true, "The header flags: bits 0-1 ASIC profile, bit 2 time offset in use (only present for v2 headers)"},
+                            {RPCResult::Type::NUM, "xor_key_mask_clear_bits", /*optional=*/true, "The number of high bits cleared in the proof-of-work XOR mask (only present for v2 headers)"},
+                            {RPCResult::Type::STR_HEX, "xor_key", /*optional=*/true, "The 128-bit proof-of-work XOR key (only present for v2 headers)"},
+                            {RPCResult::Type::STR_HEX, "mm_rhs", /*optional=*/true, "The merge-mining hook right-hand side (only present for v2 headers)"},
                             {RPCResult::Type::STR_HEX, "previousblockhash", /*optional=*/true, "The hash of the previous block (if available)"},
                             {RPCResult::Type::STR_HEX, "nextblockhash", /*optional=*/true, "The hash of the next block (if available)"},
                         }},
@@ -970,9 +1006,20 @@ static RPCHelpMan getblock()
                     {RPCResult::Type::NUM, "nonce", "The nonce"},
                     {RPCResult::Type::STR_HEX, "bits", "nBits: compact representation of the block difficulty target"},
                     {RPCResult::Type::STR_HEX, "target", "The difficulty target"},
-                    {RPCResult::Type::NUM, "difficulty", "The difficulty"},
+                    {RPCResult::Type::NUM, "difficulty", /*optional=*/true, "The proof-of-work difficulty as a multiple of the minimum difficulty (only for SHA256d blocks)"},
+                    {RPCResult::Type::NUM, "difficulty_blake2b", /*optional=*/true, "The expected average number of BLAKE2b hashes needed to find this block (only for header-v2 blocks)"},
                     {RPCResult::Type::STR_HEX, "chainwork", "Expected number of hashes required to produce the chain up to this block (in hex)"},
-                    {RPCResult::Type::NUM, "nTx", "The number of transactions in the block"},
+                    {RPCResult::Type::NUM, "nTx", "The number of transactions in the block, or 0 if only the block header is available (DEPRECATED)"},
+                    {RPCResult::Type::NUM, "txcount", /*optional=*/true, "The number of transactions in the block; for entries where only the header has been seen this is the count committed in the v2 header, and it is omitted when unknown"},
+                    {RPCResult::Type::NUM, "header_version", "2 for a BLAKE2b v2 header, 0 otherwise"},
+                    {RPCResult::Type::STR_HEX, "nonce2", /*optional=*/true, "The second nonce, in wire byte order (only present for v2 headers)"},
+                    {RPCResult::Type::STR_HEX, "nonce3", /*optional=*/true, "The third nonce, in wire byte order (only present for v2 headers)"},
+                    {RPCResult::Type::STR_HEX, "extranonce", /*optional=*/true, "The 128-bit extranonce (only present for v2 headers)"},
+                    {RPCResult::Type::NUM, "time_offset", /*optional=*/true, "The offset subtracted from the block time on the wire, per header flags bit 2 (only present for v2 headers)"},
+                    {RPCResult::Type::NUM, "header_flags", /*optional=*/true, "The header flags: bits 0-1 ASIC profile, bit 2 time offset in use (only present for v2 headers)"},
+                    {RPCResult::Type::NUM, "xor_key_mask_clear_bits", /*optional=*/true, "The number of high bits cleared in the proof-of-work XOR mask (only present for v2 headers)"},
+                    {RPCResult::Type::STR_HEX, "xor_key", /*optional=*/true, "The 128-bit proof-of-work XOR key (only present for v2 headers)"},
+                    {RPCResult::Type::STR_HEX, "mm_rhs", /*optional=*/true, "The merge-mining hook right-hand side (only present for v2 headers)"},
                     {RPCResult::Type::STR_HEX, "previousblockhash", /*optional=*/true, "The hash of the previous block (if available)"},
                     {RPCResult::Type::STR_HEX, "nextblockhash", /*optional=*/true, "The hash of the next block (if available)"},
                 }},
@@ -1788,7 +1835,8 @@ RPCHelpMan getblockchaininfo()
                 {RPCResult::Type::STR, "bestblockhash", "the hash of the currently best block"},
                 {RPCResult::Type::STR_HEX, "bits", "nBits: compact representation of the block difficulty target"},
                 {RPCResult::Type::STR_HEX, "target", "The difficulty target"},
-                {RPCResult::Type::NUM, "difficulty", "the current difficulty"},
+                {RPCResult::Type::NUM, "difficulty", /*optional=*/true, "The proof-of-work difficulty as a multiple of the minimum difficulty (only for SHA256d blocks)"},
+                {RPCResult::Type::NUM, "difficulty_blake2b", /*optional=*/true, "The expected average number of BLAKE2b hashes needed to find the tip block (only for header-v2 blocks)"},
                 {RPCResult::Type::NUM_TIME, "time", "The block time expressed in " + UNIX_EPOCH_TIME},
                 {RPCResult::Type::NUM_TIME, "mediantime", "The median block time expressed in " + UNIX_EPOCH_TIME},
                 {RPCResult::Type::NUM, "verificationprogress", "estimate of verification progress [0..1]"},
@@ -1828,7 +1876,7 @@ RPCHelpMan getblockchaininfo()
     obj.pushKV("bestblockhash", tip.GetBlockHash().GetHex());
     obj.pushKV("bits", strprintf("%08x", tip.nBits));
     obj.pushKV("target", GetTarget(tip, chainman.GetConsensus().powLimit).GetHex());
-    obj.pushKV("difficulty", GetDifficulty(tip));
+    PushDifficulty(obj, tip);
     obj.pushKV("time", tip.GetBlockTime());
     obj.pushKV("mediantime", tip.GetMedianTimePast());
     obj.pushKV("verificationprogress", chainman.GuessVerificationProgress(&tip));
@@ -1861,10 +1909,14 @@ RPCHelpMan getblockchaininfo()
 
 namespace {
 const std::vector<RPCResult> RPCHelpForDeployment{
-    {RPCResult::Type::STR, "type", "one of \"buried\", \"bip9\""},
-    {RPCResult::Type::NUM, "height", /*optional=*/true, "height of the first block which enforces the rules (only for \"buried\" type, or \"bip9\" type with \"active\" status)"},
-    {RPCResult::Type::NUM, "height_end", /*optional=*/true, "height of the last block which enforces the rules (only for \"bip9\" type with \"active\" status and temporary deployments)"},
-    {RPCResult::Type::BOOL, "active", "true if the rules are enforced for the mempool and the next block"},
+    {RPCResult::Type::STR, "type", "one of \"buried\", \"bip9\", \"flagday\""},
+    {RPCResult::Type::NUM, "height", /*optional=*/true, "height of the first block which enforces the rules (only for \"buried\" and \"flagday\" types, or \"bip9\" type with \"active\" status)"},
+    {RPCResult::Type::NUM, "height_end", /*optional=*/true, "height of the last block which enforces the rules (only for temporary deployments)"},
+    {RPCResult::Type::NUM, "coinbase_expiry_time", /*optional=*/true, "mining-block parent MTP cutoff for newly covered rewards; previously covered rewards retain long maturity after this time"},
+    {RPCResult::Type::NUM, "coinbase_start_height", /*optional=*/true, "height of the first generated coin covered by the long coinbase maturity rule (only for \"long_coinbase_maturity\")"},
+    {RPCResult::Type::NUM, "maturity", /*optional=*/true, "required coinbase maturity depth for covered generated coins (only for \"long_coinbase_maturity\")"},
+    {RPCResult::Type::BOOL, "active", "true if the consensus rules are enforced for the next block (policy may enforce related rules independently of this flag)"},
+    {RPCResult::Type::NUM_TIME, "expiry_time", /*optional=*/true, "median time past at and after which the rules are no longer enforced (only for \"flagday\" type; a block is past expiry when its parent's median time past has reached this value)"},
     {RPCResult::Type::OBJ, "bip9", /*optional=*/true, "status of bip9 softforks (only for \"bip9\" type)",
     {
         {RPCResult::Type::NUM, "bit", /*optional=*/true, "the bit (0-28) in the block version field used to signal this softfork (only for \"started\" and \"locked_in\" status)"},
@@ -1888,6 +1940,47 @@ const std::vector<RPCResult> RPCHelpForDeployment{
     }},
 };
 
+// RDTS (a flag-day deployment, not a versionbits one): rules apply to every
+// block from the BLAKE2b hardfork height until the parent block's
+// median-time-past reaches RdtsExpiryTime. Reported as-of the queried block,
+// with "active" meaning the next block, like the versionbits entries. Omitted
+// entirely when unscheduled (plain regtest), as NEVER_ACTIVE deployments are.
+void RdtsFlagDayDescPushBack(const CBlockIndex* blockindex, UniValue& softforks, const ChainstateManager& chainman)
+{
+    const Consensus::Params& params{chainman.GetConsensus()};
+    if (params.Blake2bHeight == std::numeric_limits<int>::max() ||
+        params.RdtsExpiryTime == std::numeric_limits<int64_t>::min()) return;
+
+    UniValue rv(UniValue::VOBJ);
+    rv.pushKV("type", "flagday");
+    rv.pushKV("height", params.RdtsActivationHeight());
+    rv.pushKV("expiry_time", params.RdtsExpiryTime);
+    // "active" describes the NEXT block, as the versionbits entries do, so the
+    // queried block is that block's parent and its median-time-past is exactly
+    // the parent median-time-past RdtsActiveAt expects.
+    rv.pushKV("active", params.RdtsActiveAt(blockindex->nHeight + 1, blockindex->GetMedianTimePast()));
+    softforks.pushKV("reduced_data", std::move(rv));
+}
+
+void LongCoinbaseMaturityDescPushBack(const CBlockIndex* blockindex, UniValue& softforks, const ChainstateManager& chainman)
+{
+    const Consensus::Params& params{chainman.GetConsensus()};
+    if (params.CoinbaseMaturityLongEnforceHeight == std::numeric_limits<int>::max()) return;
+
+    UniValue rv(UniValue::VOBJ);
+    rv.pushKV("type", "flagday");
+    rv.pushKV("height", params.CoinbaseMaturityLongEnforceHeight);
+    if (params.CoinbaseMaturityLongUntilRdts) {
+        rv.pushKV("coinbase_expiry_time", params.RdtsExpiryTime);
+    } else {
+        rv.pushKV("height_end", params.CoinbaseMaturityLongReleaseHeight - 1);
+    }
+    rv.pushKV("coinbase_start_height", params.CoinbaseMaturityLongStartHeight);
+    rv.pushKV("maturity", params.CoinbaseMaturityLong);
+    rv.pushKV("active", params.CoinbaseMaturityLongActiveAt(blockindex->nHeight + 1));
+    softforks.pushKV("long_coinbase_maturity", std::move(rv));
+}
+
 UniValue DeploymentInfo(const CBlockIndex* blockindex, const ChainstateManager& chainman)
 {
     UniValue softforks(UniValue::VOBJ);
@@ -1898,7 +1991,8 @@ UniValue DeploymentInfo(const CBlockIndex* blockindex, const ChainstateManager& 
     SoftForkDescPushBack(blockindex, softforks, chainman, Consensus::DEPLOYMENT_SEGWIT);
     SoftForkDescPushBack(blockindex, softforks, chainman, Consensus::DEPLOYMENT_TESTDUMMY);
     SoftForkDescPushBack(blockindex, softforks, chainman, Consensus::DEPLOYMENT_TAPROOT);
-    SoftForkDescPushBack(blockindex, softforks, chainman, Consensus::DEPLOYMENT_REDUCED_DATA);
+    RdtsFlagDayDescPushBack(blockindex, softforks, chainman);
+    LongCoinbaseMaturityDescPushBack(blockindex, softforks, chainman);
     return softforks;
 }
 } // anon namespace
@@ -1916,6 +2010,10 @@ RPCHelpMan getdeploymentinfo()
                 {RPCResult::Type::NUM, "height", "requested block height (or tip)"},
                 {RPCResult::Type::OBJ_DYN, "deployments", "", {
                     {RPCResult::Type::OBJ, "xxxx", "name of the deployment", RPCHelpForDeployment}
+                }},
+                {RPCResult::Type::OBJ, "blake2b", /*optional=*/true, "hardfork schedule, present only when one is configured", {
+                    {RPCResult::Type::NUM, "height", "the height the hardfork activates at"},
+                    {RPCResult::Type::BOOL, "active", "whether the hardfork rules apply to the block after this one"},
                 }},
             }
         },
@@ -1941,6 +2039,23 @@ RPCHelpMan getdeploymentinfo()
             deploymentinfo.pushKV("hash", blockindex->GetBlockHash().ToString());
             deploymentinfo.pushKV("height", blockindex->nHeight);
             deploymentinfo.pushKV("deployments", DeploymentInfo(blockindex, chainman));
+
+            // Reported at the top level rather than among the deployments so
+            // an operator can see whether the fork is scheduled and whether it
+            // has taken effect, instead of inferring that from rejected
+            // transactions. Every rule the fork carries activates together, at
+            // the deployment the proof-of-work change uses.
+            const Consensus::Params& consensus{chainman.GetConsensus()};
+            if (consensus.Blake2bHeight != std::numeric_limits<int>::max()) {
+                UniValue hf(UniValue::VOBJ);
+                hf.pushKV("height", consensus.Blake2bHeight);
+                // The block after this one is built on it, so ask whether the
+                // deployment is active after it. Delegated rather than
+                // open-coded so this cannot drift from consensus.
+                hf.pushKV("active", DeploymentActiveAfter(blockindex, chainman,
+                                                          Consensus::DEPLOYMENT_BLAKE2B));
+                deploymentinfo.pushKV("blake2b", std::move(hf));
+            }
             return deploymentinfo;
         },
     };
@@ -3968,7 +4083,8 @@ const std::vector<RPCResult> RPCHelpForChainstate{
     {RPCResult::Type::STR_HEX, "bestblockhash", "blockhash of the tip"},
     {RPCResult::Type::STR_HEX, "bits", "nBits: compact representation of the block difficulty target"},
     {RPCResult::Type::STR_HEX, "target", "The difficulty target"},
-    {RPCResult::Type::NUM, "difficulty", "difficulty of the tip"},
+    {RPCResult::Type::NUM, "difficulty", /*optional=*/true, "The proof-of-work difficulty as a multiple of the minimum difficulty (only for SHA256d blocks)"},
+    {RPCResult::Type::NUM, "difficulty_blake2b", /*optional=*/true, "The expected average number of BLAKE2b hashes needed to find the chainstate's tip block (only for header-v2 blocks)"},
     {RPCResult::Type::NUM, "verificationprogress", "progress towards the network tip"},
     {RPCResult::Type::STR_HEX, "snapshot_blockhash", /*optional=*/true, "the base block of the snapshot this chainstate is based on, if any"},
     {RPCResult::Type::NUM, "coins_db_cache_bytes", "size of the coinsdb cache"},
@@ -4012,7 +4128,7 @@ return RPCHelpMan{
         data.pushKV("bestblockhash",         tip->GetBlockHash().GetHex());
         data.pushKV("bits", strprintf("%08x", tip->nBits));
         data.pushKV("target", GetTarget(*tip, chainman.GetConsensus().powLimit).GetHex());
-        data.pushKV("difficulty", GetDifficulty(*tip));
+        PushDifficulty(data, *tip);
         data.pushKV("verificationprogress", chainman.GuessVerificationProgress(tip));
         data.pushKV("coins_db_cache_bytes",  cs.m_coinsdb_cache_size_bytes);
         data.pushKV("coins_tip_cache_bytes", cs.m_coinstip_cache_size_bytes);
@@ -4161,7 +4277,6 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getblockhash},
         {"blockchain", &getblockheader},
         {"blockchain", &getchaintips},
-        {"blockchain", &getdifficulty},
         {"blockchain", &getdeploymentinfo},
         {"blockchain", &gettxout},
         {"blockchain", &gettxoutsetinfo},

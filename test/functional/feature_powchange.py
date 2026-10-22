@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 The Bitcoin Knots developers
+# Distributed under the MIT software license, see the accompanying
+# file COPYING or http://www.opensource.org/licenses/mit-license.php.
+"""Exercise the height-activated proof-of-work change on regtest."""
+
+import json
+from decimal import Decimal
+from pathlib import Path
+
+from test_framework.blocktools import create_block, create_coinbase
+from test_framework.messages import (
+    CBlockHeader,
+    blake2b_header_hash_components,
+    from_hex,
+    hash256,
+    powhash,
+)
+from test_framework.test_framework import BitcoinTestFramework
+from test_framework.util import assert_equal, assert_raises_rpc_error
+from test_framework.wallet import MiniWallet
+
+CHANGE_HEIGHT = 20
+V2_HEADER_KEYS = (
+    "header_version",
+    "nonce2",
+    "nonce3",
+    "extranonce",
+    "time_offset",
+    "header_flags",
+    "xor_key_mask_clear_bits",
+    "xor_key",
+    "mm_rhs",
+)
+
+
+def assert_sha256d_difficulty(result, expected):
+    assert_equal(result["difficulty"], expected)
+    assert "difficulty_blake2b" not in result
+
+
+def assert_blake2b_difficulty(result, expected):
+    assert_equal(result["difficulty_blake2b"], expected)
+    assert "difficulty" not in result
+
+
+class PowChangeTest(BitcoinTestFramework):
+    def set_test_params(self):
+        self.setup_clean_chain = True
+        self.num_nodes = 1
+        self.extra_args = [
+            [
+                f"-testactivationheight=blake2b@{CHANGE_HEIGHT}",
+                '-blake2b_headline=BLAKE2b functional test headline',
+            ],
+        ]
+
+    def get_header(self, blockhash):
+        return from_hex(CBlockHeader(), self.nodes[0].getblockheader(blockhash, False))
+
+    def test_header_vectors(self):
+        vectors_path = Path(self.config["environment"]["SRCDIR"]) / "src/test/data/block_header_v2.json"
+        with vectors_path.open(encoding="utf8") as vectors_file:
+            vectors = json.load(vectors_file)["headers"]
+
+        for vector in vectors:
+            fields = vector["fields"]
+            header = CBlockHeader()
+            header.m_header_v2 = True
+            header.nVersion = fields["nVersion"]
+            header.hashPrevBlock = int(fields["hashPrevBlock"], 16)
+            header.hashMerkleRoot = int(fields["hashMerkleRoot"], 16)
+            header.nTime = fields["nTime"]
+            header.nBits = fields["nBits"]
+            header.nNonce = fields["nNonce"]
+            header.m_nonce2 = fields["m_nonce2"]
+            header.m_nonce3 = fields["m_nonce3"]
+            header.m_extranonce = int(fields["m_extranonce"], 16)
+            header.m_time_offset = fields["m_time_offset"]
+            header.m_txcount = fields["m_txcount"]
+            header.m_flags = fields["m_flags"]
+            header.m_xor_key_mask_clear_bits = fields["m_xor_key_mask_clear_bits"]
+            header.m_xor_key = int(fields["m_xor_key"], 16)
+            header.m_height = fields["m_height"]
+            header.m_mm_rhs = int(fields["m_mm_rhs"], 16)
+
+            assert_equal(len(header.serialize()), 164)
+            assert_equal(header.serialize().hex(), vector["serialized"])
+            components = blake2b_header_hash_components(header)
+            assert_equal(components["asic_profile"], vector["asic_profile"])
+            assert_equal(components["asic_input"].hex(), vector["asic_input"])
+            for component in ("xor_key_hash", "h1", "h2", "mask"):
+                assert_equal(components[component].hex(), vector[component])
+            assert_equal(components["hash1"].hex(), vector["blake2b_1"])
+            assert_equal(components["hash2"].hex(), vector["blake2b_2"])
+            assert_equal(components["result"].hex(), vector["block_hash"])
+            assert_equal(powhash(header)[::-1].hex(), vector["block_hash"])
+
+    def run_test(self):
+        node = self.nodes[0]
+        addr = node.get_deterministic_priv_key().address
+
+        self.test_header_vectors()
+
+        self.log.info("Blocks before the activation height use SHA256d")
+        self.generatetoaddress(node, CHANGE_HEIGHT - 2, addr)
+        pre_parent_hash = node.getbestblockhash()
+        pre_parent = node.getblockheader(pre_parent_hash)
+        pre_template = node.getblocktemplate({"rules": ["segwit"]})
+        assert "!blake2b" not in pre_template["rules"]
+        assert not pre_template["version"] & 0x80000000
+
+        invalid_pre_header = create_block(
+            int(pre_parent_hash, 16),
+            create_coinbase(CHANGE_HEIGHT - 1),
+            pre_parent["time"] + 1,
+            height=CHANGE_HEIGHT - 1,
+            header_v2=True,
+        )
+        invalid_pre_header.solve()
+        assert_raises_rpc_error(
+            -25, "bad-version-sha256d",
+            lambda: node.submitheader(hexdata=CBlockHeader(invalid_pre_header).serialize().hex()),
+        )
+
+        pre_hash = self.generatetoaddress(node, 1, addr)[0]
+        pre_header = self.get_header(pre_hash)
+        assert_equal(node.getblockcount(), CHANGE_HEIGHT - 1)
+        assert not pre_header.m_header_v2
+        assert_equal(len(pre_header.serialize()), 80)
+        assert_equal(pre_hash, hash256(pre_header.serialize())[::-1].hex())
+        assert_equal(pre_hash, powhash(pre_header)[::-1].hex())
+        pre_difficulty = Decimal('4.656542373906925E-10')
+        assert_sha256d_difficulty(node.getblockheader(pre_hash), pre_difficulty)
+        assert_sha256d_difficulty(node.getblock(pre_hash), pre_difficulty)
+        assert_sha256d_difficulty(node.getblockchaininfo(), pre_difficulty)
+        assert_sha256d_difficulty(node.getchainstates()["chainstates"][-1], pre_difficulty)
+        mining_info = node.getmininginfo()
+        assert_sha256d_difficulty(mining_info, pre_difficulty)
+        assert_equal(mining_info["next"]["height"], CHANGE_HEIGHT)
+        assert_blake2b_difficulty(mining_info["next"], 2)
+
+        self.log.info("The activation block and its successors use BLAKE2b")
+        assert_raises_rpc_error(
+            -8, "Support for 'blake2b' rule requires explicit client support",
+            lambda: node.getblocktemplate({"rules": ["segwit"]}),
+        )
+        template = node.getblocktemplate({"rules": ["segwit", "blake2b"]})
+        assert_equal(template["height"], CHANGE_HEIGHT)
+        assert template["version"] & 0x80000000
+        assert "!blake2b" in template["rules"]
+
+        invalid_activation_block = create_block(
+            int(pre_hash, 16),
+            create_coinbase(CHANGE_HEIGHT),
+            pre_header.nTime + 1,
+            height=CHANGE_HEIGHT,
+            header_v2=True,
+        )
+        invalid_activation_block.solve()
+        assert_equal(node.submitblock(invalid_activation_block.serialize().hex()), "bad-headline")
+
+        post_hash = self.generatetoaddress(node, 1, addr)[0]
+        post_header = self.get_header(post_hash)
+        assert_equal(node.getblockcount(), CHANGE_HEIGHT)
+        assert post_header.m_header_v2
+        assert_equal(post_header.m_height, CHANGE_HEIGHT)
+        assert_equal(post_header.m_txcount, 1)
+        assert_equal(len(post_header.serialize()), 164)
+        assert_equal(post_hash, powhash(post_header)[::-1].hex())
+        verbose_post_header = node.getblockheader(post_hash)
+        assert_equal(verbose_post_header["version"], post_header.nVersion)
+        assert_equal(verbose_post_header["versionHex"], f"{post_header.nVersion:08x}")
+        assert_blake2b_difficulty(verbose_post_header, 2)
+        assert_blake2b_difficulty(node.getblock(post_hash), 2)
+        assert_blake2b_difficulty(node.getblockchaininfo(), 2)
+        assert_blake2b_difficulty(node.getchainstates()["chainstates"][-1], 2)
+        mining_info = node.getmininginfo()
+        assert_blake2b_difficulty(mining_info, 2)
+        assert_equal(mining_info["next"]["height"], CHANGE_HEIGHT + 1)
+        assert_blake2b_difficulty(mining_info["next"], 2)
+
+        self.log.info("The high two flag bits are reserved")
+        for high_flag in (0x40, 0x80):
+            invalid_flags = create_block(
+                int(post_hash, 16),
+                create_coinbase(CHANGE_HEIGHT + 1),
+                post_header.nTime + 1,
+                height=CHANGE_HEIGHT + 1,
+                header_v2=True,
+            )
+            invalid_flags.m_flags |= high_flag
+            invalid_flags.solve()
+            assert_raises_rpc_error(
+                -25, "bad-flags-highbits",
+                lambda: node.submitheader(hexdata=CBlockHeader(invalid_flags).serialize().hex()),
+            )
+
+        self.log.info("Verbose getblockheader exposes the v2 header fields")
+        post_json = node.getblockheader(post_hash, True)
+        for key in V2_HEADER_KEYS:
+            assert key in post_json, f"missing {key} in verbose v2 header"
+        assert_equal(post_json["header_version"], 2)
+        pre_json = node.getblockheader(pre_hash, True)
+        assert_equal(pre_json["header_version"], 0)
+
+        # A null XOR key disables anti-withholding regardless of how many mask
+        # bits the pool requests to clear.
+        assert_equal(post_header.m_xor_key, 0)
+        post_header.m_xor_key_mask_clear_bits = 255
+        disabled_xor = blake2b_header_hash_components(post_header)
+        assert_equal(disabled_xor["mask"], bytes(32))
+        assert_equal(disabled_xor["result"], disabled_xor["hash2"])
+
+        merge_mined_block = create_block(
+            int(post_hash, 16),
+            create_coinbase(CHANGE_HEIGHT + 1),
+            post_header.nTime + 1,
+            height=CHANGE_HEIGHT + 1,
+            header_v2=True,
+        )
+        merge_mined_block.m_xor_key = 0x0123456789abcdef0123456789abcdef
+        merge_mined_block.m_xor_key_mask_clear_bits = 255
+        merge_mined_block.m_mm_rhs = 0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
+        merge_mined_block.m_extranonce = 0x00112233445566778899aabbccddeeff
+        merge_mined_block.m_nonce2 = 0xdeadbeef
+        merge_mined_block.m_nonce3 = 0xfeedface
+        merge_mined_block.solve()
+        assert_equal(node.submitblock(merge_mined_block.serialize().hex()), None)
+
+        # The blob fields are emitted in wire (forward) byte order, so the
+        # expected hex is the block's own value serialised little-endian.
+        mm_json = node.getblockheader(node.getbestblockhash(), True)
+        assert_equal(mm_json["header_version"], 2)
+        assert_equal(mm_json["extranonce"], merge_mined_block.m_extranonce.to_bytes(16, "little").hex())
+        assert_equal(mm_json["xor_key"], merge_mined_block.m_xor_key.to_bytes(16, "little").hex())
+        assert_equal(mm_json["mm_rhs"], merge_mined_block.m_mm_rhs.to_bytes(32, "little").hex())
+        assert_equal(mm_json["xor_key_mask_clear_bits"], merge_mined_block.m_xor_key_mask_clear_bits)
+        assert_equal(mm_json["header_flags"], merge_mined_block.m_flags)
+        assert_equal(mm_json["time_offset"], merge_mined_block.m_time_offset)
+        assert_equal(len(mm_json["nonce2"]), 8)
+        assert_equal(len(mm_json["nonce3"]), 8)
+        assert_equal(mm_json["nonce2"], merge_mined_block.m_nonce2.to_bytes(4, "little").hex())
+        assert_equal(mm_json["nonce3"], merge_mined_block.m_nonce3.to_bytes(4, "little").hex())
+
+        invalid_txcount = create_block(
+            merge_mined_block.sha256,
+            create_coinbase(CHANGE_HEIGHT + 2),
+            merge_mined_block.nTime + 1,
+            height=CHANGE_HEIGHT + 2,
+            header_v2=True,
+        )
+        invalid_txcount.m_txcount += 1
+        invalid_txcount.solve()
+        assert_equal(node.submitblock(invalid_txcount.serialize().hex()), "bad-txnlist-size")
+
+        invalid_height = create_block(
+            merge_mined_block.sha256,
+            create_coinbase(CHANGE_HEIGHT + 2),
+            merge_mined_block.nTime + 1,
+            height=CHANGE_HEIGHT + 2,
+            header_v2=True,
+        )
+        invalid_height.m_height += 1
+        invalid_height.solve()
+        assert_raises_rpc_error(
+            -25, "bad-header-height",
+            lambda: node.submitheader(hexdata=CBlockHeader(invalid_height).serialize().hex()),
+        )
+
+        invalid_post_header = create_block(
+            merge_mined_block.sha256,
+            create_coinbase(CHANGE_HEIGHT + 2),
+            merge_mined_block.nTime + 1,
+            height=CHANGE_HEIGHT + 2,
+            header_v2=False,
+        )
+        invalid_post_header.solve()
+        assert_raises_rpc_error(
+            -25, "bad-version-blake2b",
+            lambda: node.submitheader(hexdata=CBlockHeader(invalid_post_header).serialize().hex()),
+        )
+
+        self.log.info("Regenerating commitments refreshes the transaction count")
+        wallet = MiniWallet(node)
+        self.generate(wallet, 100)
+        transaction = wallet.create_self_transfer()
+        generated = self.generateblock(node, wallet.get_address(), [transaction["hex"]])
+        generated_block = node.getblock(generated["hash"])
+        generated_header = self.get_header(generated["hash"])
+        assert_equal(len(generated_block["tx"]), 2)
+        assert_equal(generated_header.m_txcount, 2)
+
+        self.log.info("Header-only entries take nTx from the v2 header, or omit it")
+        # Submitting only the header leaves an index entry with no block body,
+        # so any transaction count can come only from the header itself. The
+        # count below deliberately differs from the block's own transaction
+        # list, which the node never sees.
+        v2_header_only = create_block(
+            merge_mined_block.sha256,
+            create_coinbase(CHANGE_HEIGHT + 2),
+            merge_mined_block.nTime + 2,
+            height=CHANGE_HEIGHT + 2,
+            header_v2=True,
+        )
+        v2_header_only.m_txcount = 3
+        v2_header_only.solve()
+        assert_equal(node.submitheader(hexdata=CBlockHeader(v2_header_only).serialize().hex()), None)
+        v2_header_only_json = node.getblockheader(v2_header_only.hash, True)
+        assert_equal(v2_header_only_json["header_version"], 2)
+        assert_equal(v2_header_only_json["nTx"], 0)
+        assert_equal(v2_header_only_json["txcount"], 3)
+
+        # A v1 header commits to no count, so nTx is omitted entirely until the
+        # block itself arrives.
+        v1_header_only = create_block(
+            int(pre_parent_hash, 16),
+            create_coinbase(CHANGE_HEIGHT - 1),
+            pre_parent["time"] + 2,
+            height=CHANGE_HEIGHT - 1,
+            header_v2=False,
+        )
+        v1_header_only.solve()
+        assert_equal(node.submitheader(hexdata=CBlockHeader(v1_header_only).serialize().hex()), None)
+        v1_header_only_json = node.getblockheader(v1_header_only.hash, True)
+        assert_equal(v1_header_only_json["header_version"], 0)
+        assert_equal(v1_header_only_json["nTx"], 0)
+        assert "txcount" not in v1_header_only_json
+
+        # Fully downloaded blocks keep reporting their actual count.
+        assert_equal(node.getblockheader(pre_hash, True)["nTx"], 1)
+        assert_equal(node.getblockheader(post_hash, True)["nTx"], 1)
+
+
+if __name__ == "__main__":
+    PowChangeTest(__file__).main()
